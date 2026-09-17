@@ -449,6 +449,8 @@ impl WhatsAppApp {
             return;
         };
         let waiting = client.storage_usage();
+        #[cfg(target_family = "wasm")]
+        let account = client.account();
         // Which account asked. The task is detached and the daemon it asked
         // can be replaced while it is still measuring, so the answer has to
         // say whose it is: Settings stays open across a re-pair, and the old
@@ -457,9 +459,17 @@ impl WhatsAppApp {
         let settings = self.settings.clone();
         let epoch = settings.read(cx).epoch();
         cx.spawn(async move |_: WeakEntity<Self>, cx| {
-            let Ok(usage) = waiting.await else {
+            #[cfg_attr(not(target_family = "wasm"), allow(unused_mut))]
+            let Ok(mut usage) = waiting.await else {
                 return;
             };
+            #[cfg(target_family = "wasm")]
+            {
+                let (avatar_bytes, avatar_files) =
+                    crate::session::avatar::avatar_cache_usage(account).await;
+                usage.media_bytes = usage.media_bytes.saturating_add(avatar_bytes);
+                usage.media_files = usage.media_files.saturating_add(avatar_files);
+            }
             settings.update(cx, |settings, cx| settings.measured(usage, epoch, cx));
         })
         .detach();
@@ -568,6 +578,7 @@ impl WhatsAppApp {
         let Some(client) = &self.client else {
             return;
         };
+        let account = client.account();
         let cleared = client.clear_media_cache();
         let entity = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
@@ -576,13 +587,13 @@ impl WhatsAppApp {
             if cleared.await.is_err() {
                 return;
             }
+            crate::session::avatar::clear_cache_storage(Some(account)).await;
             let _ = entity.update(cx, |app, cx| {
                 app.avatar_manager.clear();
-                crate::session::avatar::spawn_task(async {
-                    crate::session::avatar::clear_cache_storage().await;
-                });
+                app.last_avatar_window_fingerprint = None;
                 crate::session::clear_image_sources();
                 app.refresh_storage_usage(cx);
+                cx.notify();
             });
         })
         .detach();

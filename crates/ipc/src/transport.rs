@@ -5,6 +5,14 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 32: `ClientRequest::EnsureAvatars`, which carries the viewport's avatar
+/// demands to the daemon so profile pictures are resolved on demand rather
+/// than for every chat the history load names. A v31 daemon does not know the
+/// request and refuses it as malformed — and the daemon is the half that
+/// deliberately outlives an upgrade, so without a version an upgraded window
+/// would demand avatars that never resolve. Exactly the case v15, v21, v23,
+/// v24, v25 and v27 were bumped for.
+///
 /// 31: `ClientRequest::Hello` binds a connection to either the control plane
 /// or one immutable `AccountId`; control listings and lifecycle requests have
 /// separate wire messages, and account requests no longer carry an account id
@@ -239,9 +247,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-/// v31 binds a connection to either the control plane or one AccountId and
-/// separates global-window ownership from account call-video subscription.
-pub const PROTOCOL_VERSION: u32 = 31;
+pub const PROTOCOL_VERSION: u32 = 32;
 
 /// Where the daemon's web bridge listens when nobody says otherwise.
 ///

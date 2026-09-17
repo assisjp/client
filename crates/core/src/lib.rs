@@ -42,6 +42,7 @@ mod video;
 
 pub use account::{AccountId, InvalidAccountId};
 pub use app_state::{AppState, CachedQrCode, Fault, Issued, Lifetime, Recovery};
+pub use avatar::AvatarDemand;
 pub use avatar::cache_key as avatar_cache_key;
 pub use call::{CallId, IncomingCall, OutgoingCall, OutgoingCallState};
 pub use calls::{ActiveCall, Admission, CallState, Ending, Stage, WaitingCall};

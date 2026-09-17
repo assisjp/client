@@ -80,6 +80,8 @@ pub enum Action {
     /// purge it. See [`AccountDisposition`] for what each choice leaves
     /// behind.
     ForgetSession(AccountDisposition),
+    /// Demand profile pictures for visible rows or overscan.
+    EnsureAvatars(Vec<oxidezap_core::AvatarDemand>),
     /// Asynchronous request from the new wire protocol.
     Wire {
         id: u64,
@@ -218,6 +220,7 @@ impl Action {
                     // lose the reset rather than defer it — the descriptors
                     // would keep pointing at bytes the clear just removed.
                     | Self::RefreshAvatars
+                    | Self::EnsureAvatars(_)
                     // A group's members, too: the connection holds that list
                     // because sending needs one, so the common answer is a read
                     // of what is already held. Gating it on the network would

@@ -24,12 +24,13 @@
 //! which side it is on.
 
 mod attach;
+pub mod avatar;
 #[cfg(target_family = "wasm")]
 mod embedded;
 mod frames;
 mod media;
 pub use media::MediaCache;
-pub(crate) use media::clear_image_sources;
+pub(crate) use media::{clear_image_sources, get_avatar_image};
 #[cfg(not(target_family = "wasm"))]
 mod native;
 mod recovery;
@@ -1615,6 +1616,21 @@ impl SessionHandle {
         let (tx, rx) = oneshot::channel();
         self.ask(ClientRequest::ClearMediaCache, Awaiting::Acted(tx));
         rx
+    }
+
+    /// Demand profile pictures for visible rows or overscan.
+    pub fn ensure_avatars(&self, items: Vec<oxidezap_core::AvatarDemand>) {
+        if items.is_empty() {
+            return;
+        }
+        self.tell(ClientRequest::EnsureAvatars(oxidezap_ipc::EnsureAvatars {
+            items,
+        }));
+    }
+
+    /// Publish an avatar ready notification to the UI event sink.
+    pub fn notify_avatar_ready(&self, jid: String, key: String) {
+        let _ = self.conn.events.try_send(FromDaemon::Avatar { jid, key });
     }
 
     /// Fetch media, answered when the bytes are available.

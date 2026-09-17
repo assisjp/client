@@ -385,7 +385,16 @@ mod page {
                         // miss every one of them and draw them in the ordinary
                         // media map, where the avatar lookup never finds them.
                         if oxidezap_ipc::key_local_name(&key).starts_with("a-") {
-                            into.put_avatar(key, bytes);
+                            if let Some((image, decoded_size)) =
+                                crate::session::media::decode_avatar(&bytes)
+                            {
+                                crate::session::media::put_avatar_image(
+                                    key.clone(),
+                                    image,
+                                    decoded_size,
+                                );
+                            }
+                            crate::session::avatar::save_avatar(&key, &bytes);
                         } else {
                             into.put(key, bytes);
                         }

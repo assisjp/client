@@ -78,6 +78,12 @@ pub enum Action {
     /// Wipe local state so the user can pair again. The daemon owns the store
     /// file, so it is the only process that may delete it.
     ForgetSession,
+    /// Asynchronous request from the new wire protocol.
+    Wire {
+        id: u64,
+        request: oxidezap_wire::request::ClientRequest,
+        answer_to: Outbox,
+    },
 }
 
 impl Action {
@@ -94,33 +100,131 @@ impl Action {
     /// exactly the views taken while offline, and there is no retry — the
     /// window has already drawn the ring as watched.
     pub fn needs_network(&self) -> bool {
-        // Reading a page is the same kind of thing as reloading history: it
-        // is a query against the local store, and a window scrolling back
-        // through a conversation it already has is not something to refuse
-        // because the network is down.
-        !matches!(
-            self,
-            Self::ReloadHistory
-                | Self::RefreshVideo
-                | Self::ForgetSession
-                | Self::MarkStatusWatched(_)
-                | Self::LoadMessages { .. }
-                | Self::LoadChats { .. }
-                // Local, and only local: it forgets what the resolver knows and
-                // asks for a pass. The pass needs the network and tolerates
-                // not having it, so refusing this offline would lose the reset
-                // rather than defer it — the descriptors would keep pointing
-                // at bytes the clear just removed.
-                | Self::RefreshAvatars
-                // A group's members, too: the connection holds that list
-                // because sending needs one, so the common answer is a read
-                // of what is already held. Gating it on the network would
-                // empty the header's line for the length of a blip and put it
-                // back only when the conversation was opened again; a query
-                // that does have to go to the wire fails on its own and says
-                // asking again may work.
-                | Self::GroupMembers { .. }
-        )
+        match self {
+            Self::Wire { request, .. } => wire_needs_network(request),
+            _ => !matches!(
+                self,
+                Self::ReloadHistory
+                    | Self::RefreshVideo
+                    | Self::ForgetSession
+                    | Self::MarkStatusWatched(_)
+                    | Self::LoadMessages { .. }
+                    | Self::LoadChats { .. }
+                    // Local, and only local: it forgets what the resolver knows
+                    // and asks for a pass. The pass needs the network and
+                    // tolerates not having it, so refusing this offline would
+                    // lose the reset rather than defer it — the descriptors
+                    // would keep pointing at bytes the clear just removed.
+                    | Self::RefreshAvatars
+                    // A group's members, too: the connection holds that list
+                    // because sending needs one, so the common answer is a read
+                    // of what is already held. Gating it on the network would
+                    // empty the header's line for the length of a blip and put
+                    // it back only when the conversation was opened again; a
+                    // query that does have to go to the wire fails on its own
+                    // and says asking again may work.
+                    | Self::GroupMembers { .. }
+            ),
+        }
+    }
+}
+
+/// Whether carrying a wire request out needs the account's connection.
+///
+/// Independent of [`ClientRequest::access`](oxidezap_wire::ClientRequest::access):
+/// that answers "is this a write" for the read-only gate, and this answers
+/// "does this reach WhatsApp" for the live-connection gate. A local mutation
+/// (a tag, a cache wipe) needs no connection, and a network read (a profile,
+/// a channel list) does.
+///
+/// Exhaustive on purpose. The version this replaced inferred the answer from
+/// `is_mutation`, which is wrong in both directions: it gated local writes
+/// that work fine offline, and let network reads through to fail deeper down
+/// with a session error instead of the `not_connected` the gate would have
+/// given them. A variant added here fails to compile until it says which it is.
+fn wire_needs_network(request: &oxidezap_wire::request::ClientRequest) -> bool {
+    use oxidezap_wire::request::ClientRequest as R;
+    match request {
+        // Local, or the handshake itself.
+        R::Hello { .. }
+        | R::GetStatus
+        | R::ListMessages { .. }
+        | R::GetMessage { .. }
+        | R::GetMessageContext { .. }
+        | R::SearchMessages { .. }
+        | R::ListStarredMessages { .. }
+        | R::ListChats { .. }
+        | R::GetChat { .. }
+        | R::ListContacts { .. }
+        | R::GetContact { .. }
+        | R::SetContactAlias { .. }
+        | R::TagContact { .. }
+        | R::UntagContact { .. }
+        | R::ListPolls { .. }
+        | R::GetPoll { .. }
+        | R::ListCalls { .. }
+        | R::HistoryCoverage { .. }
+        | R::CleanupChats
+        | R::PurgeMessages { .. }
+        | R::ListAccounts
+        | R::GetStorageUsage
+        | R::ClearMediaCache
+        | R::DoctorCheck
+        | R::ForgetSession
+        | R::Shutdown
+        // Pairing is the connection attempt itself: the account is in
+        // `Pairing`, never `Connected`, for the whole of it, so gating it on
+        // a live connection refuses the one request trying to establish one.
+        | R::RequestPairCode { .. } => false,
+
+        // Reaches WhatsApp.
+        R::CheckContact { .. }
+        | R::RefreshContacts { .. }
+        | R::ListGroups
+        | R::GetGroupInfo { .. }
+        | R::CreateGroup { .. }
+        | R::SetGroupTopic { .. }
+        | R::SetGroupDescription { .. }
+        | R::ManageGroupParticipant { .. }
+        | R::GetGroupInviteLink { .. }
+        | R::JoinGroup { .. }
+        | R::LeaveGroup { .. }
+        | R::SetGroupPermissions { .. }
+        | R::ListGroupJoinRequests { .. }
+        | R::ManageGroupJoinRequest { .. }
+        | R::ListChannels
+        | R::GetChannelInfo { .. }
+        | R::JoinChannel { .. }
+        | R::LeaveChannel { .. }
+        | R::GetProfile { .. }
+        | R::GetBusinessProfile { .. }
+        | R::SetProfileAbout { .. }
+        | R::SetProfileName { .. }
+        | R::SetProfilePicture { .. }
+        | R::RemoveProfilePicture
+        | R::SetPresence { .. }
+        | R::MarkRead { .. }
+        | R::MarkUnread { .. }
+        | R::PinChat { .. }
+        | R::MuteChat { .. }
+        | R::ArchiveChat { .. }
+        | R::EditMessage { .. }
+        | R::RevokeMessage { .. }
+        | R::ForwardMessage { .. }
+        | R::SendText { .. }
+        | R::SendMedia { .. }
+        | R::SendAudio { .. }
+        | R::SendReaction { .. }
+        | R::SendPoll { .. }
+        | R::VotePoll { .. }
+        | R::SendLocation { .. }
+        | R::SendStatus { .. }
+        | R::SendSticker { .. }
+        | R::SendListResponse { .. }
+        | R::DownloadMedia { .. }
+        | R::RetryMedia { .. }
+        | R::BackfillMedia { .. }
+        | R::HistoryBackfill { .. } => true,
     }
 }
 

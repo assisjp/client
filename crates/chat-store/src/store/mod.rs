@@ -240,6 +240,12 @@ fn adopt_renumbered(conn: &mut SqliteConnection) -> diesel::QueryResult<()> {
             "SELECT count(*) AS count FROM sqlite_master \
              WHERE type = 'table' AND name = 'avatar_descriptors'",
         ),
+        (
+            "20260916000001",
+            "20260916100002",
+            "SELECT count(*) AS count FROM sqlite_master \
+             WHERE type = 'table' AND name = 'contact_labels'",
+        ),
     ];
     for (old, new, produced) in RENUMBERED {
         let mut recorded = |version: &str| -> diesel::QueryResult<i64> {
@@ -688,9 +694,24 @@ mod migration_tests {
         .expect("create store");
         ChatStore::new(&store).await.expect("run migrations");
 
-        // The avatar descriptors are derived state, so reverting them is
-        // cheap and loses nothing durable: the table goes and a later start
-        // refetches. It is the most recent migration, so it reverts first.
+        // Reverted in reverse application order. The labels migration is on
+        // top: the table holds device-local metadata with no source to re-read
+        // it from, so its down migration drops it, which is the honest answer
+        // rather than a failed revert.
+        store
+            .shared()
+            .run(|conn| {
+                conn.revert_last_migration(MIGRATIONS)
+                    .map(|_| ())
+                    .map_err(StoreError::Migration)
+            })
+            .await
+            .expect("revert the reversible labels migration");
+        assert!(!has_table(&store, "contact_labels").await);
+
+        // The avatar descriptors are derived state, so reverting them is cheap
+        // and loses nothing durable: the table goes and a later start
+        // refetches.
         store
             .shared()
             .run(|conn| {
@@ -717,7 +738,7 @@ mod migration_tests {
         assert!(!has_column(&store, "messages", "id").await);
         assert!(!has_column(&store, "messages", "proto_codec").await);
 
-        // The sender-identity migration below it is not: collapsing the
+        // The sender-identity migration below those is not: collapsing the
         // identity key back cannot reunite rows that became distinct, so it
         // still refuses.
         let error = store

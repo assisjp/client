@@ -22,14 +22,10 @@ use crate::exec::Task;
 impl WhatsAppClient {
     /// Everyone in `jid`, named the way every other surface names them.
     ///
-    /// Through [`Groups::query_info`], which is the cached, send-oriented
-    /// view: a group that has been written to or read from since the last
-    /// membership change is answered without touching the network, and a miss
-    /// sends the participant hash so an unchanged group costs a
-    /// `not-modified` rather than a full download. The fuller
-    /// `Groups::get_metadata` — subject, description, admin roles — has no
-    /// cache in front of it at all, and none of what it adds is drawn
-    /// anywhere yet.
+    /// Through [`Groups::routing_info`], the cache-preferred participant
+    /// lookup exposed by the companion upstream API PR. Repeated opens are
+    /// therefore served from the existing routing cache; only cache misses
+    /// reach the network.
     ///
     /// Names come from the [`NameBook`](crate::names::NameBook) like a
     /// bubble's do, so the same person is not "Ana" over their message and a
@@ -49,7 +45,7 @@ impl WhatsAppClient {
             let info = live
                 .client
                 .groups()
-                .query_info(&group)
+                .routing_info(&group)
                 .await
                 .map_err(|e| e.to_string())?;
             // Both of this account's addresses, because a group addresses its
@@ -94,15 +90,15 @@ impl WhatsAppClient {
             let participating = live
                 .client
                 .groups()
-                .get_participating()
+                .list_participating()
                 .await
                 .map_err(|e| e.to_string())?;
             let mut groups: Vec<GroupListEntry> = participating
-                .into_values()
+                .into_iter()
                 .map(|meta| GroupListEntry {
                     jid: meta.id.to_string(),
-                    subject: meta.subject,
-                    participant_count: meta.participants.len(),
+                    subject: meta.subject.unwrap_or_default(),
+                    participant_count: meta.participant_count.unwrap_or_default() as usize,
                 })
                 .collect();
             groups.sort_by(|a, b| a.subject.cmp(&b.subject));
@@ -126,12 +122,12 @@ impl WhatsAppClient {
             let meta = live
                 .client
                 .groups()
-                .get_metadata(&group)
+                .fetch_metadata(&group)
                 .await
                 .map_err(|e| e.to_string())?;
             Ok(GroupDetails {
                 jid: meta.id.to_string(),
-                subject: meta.subject,
+                subject: meta.subject.unwrap_or_default(),
                 description: meta.description,
                 owner_jid: meta.creator.map(|j| j.to_string()),
                 participant_count: meta.participants.len(),

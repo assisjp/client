@@ -4,6 +4,8 @@
 mod avatar;
 /// Voice calls, which are the one part of the session a page cannot run.
 mod calls;
+/// Display names for special chats, resolved on their own lifecycle.
+mod chat_names;
 #[cfg(all(feature = "test-support", not(target_family = "wasm")))]
 pub use calls::{OutgoingAcceptCase, outgoing_accept_events};
 
@@ -211,6 +213,9 @@ pub(crate) struct Session {
     /// The session's one address book, so a live bubble, the row it lands in
     /// and the typing line above it name the same person the same way.
     pub(crate) names: Arc<NameBook>,
+    /// The name resolver signal used by outgoing writes as well as inbound
+    /// sightings, so a locally created special-chat row is not left nameless.
+    resolve_chat_names: chat_names::ChatNameResolveSignal,
 }
 
 /// Where the one session lives: `None` until it is open, and `None` again the
@@ -373,6 +378,10 @@ struct Shared {
     /// exists to keep apart, and a receipt that asks for history must not
     /// drag a profile-picture lookup behind it.
     resolve_avatars: AvatarResolveSignal,
+    /// Asks the chat-name resolver for a pass. Its own signal for the same
+    /// reason: a receipt that asks for history must not drag a metadata
+    /// lookup behind it either.
+    resolve_chat_names: chat_names::ChatNameResolveSignal,
     history_budget: Arc<ui_queue::HistoryBudget>,
 }
 
@@ -621,6 +630,15 @@ pub struct WhatsAppClient {
     /// had not moved. The flag is set by a media-cache clear, where the
     /// metadata may be unchanged but the bytes it named are gone.
     resolve_avatars: AvatarResolveSignal,
+    /// Asks the chat-name resolver for a pass.
+    ///
+    /// Its own lifecycle like the avatar one beside it, for the same
+    /// reason: a display name is stable metadata, and running its lookup
+    /// behind every store invalidation would couple a network round trip to
+    /// a local read. A connect asks for a full pass (a subject can change
+    /// while the process is offline); a live message in an unnamed special
+    /// chat asks for just that chat.
+    resolve_chat_names: chat_names::ChatNameResolveSignal,
 }
 
 impl WhatsAppClient {
@@ -653,6 +671,7 @@ impl WhatsAppClient {
     ) -> std::io::Result<Self> {
         let reload = Arc::new(tokio::sync::Notify::new());
         let resolve_avatars = AvatarResolveSignal::new();
+        let resolve_chat_names = chat_names::ChatNameResolveSignal::new();
         let history_budget = Arc::new(ui_queue::HistoryBudget::new());
         let (ui_sender, ui_events) = ui_queue::channel(reload.clone(), history_budget.clone());
         Ok(Self {
@@ -671,6 +690,7 @@ impl WhatsAppClient {
             reload,
             history_budget,
             resolve_avatars,
+            resolve_chat_names,
         })
     }
 
@@ -858,6 +878,7 @@ impl WhatsAppClient {
         let shutdown = self.shutdown.clone();
         let reload = self.reload.clone();
         let resolve_avatars = self.resolve_avatars.clone();
+        let resolve_chat_names = self.resolve_chat_names.clone();
         let history_budget = self.history_budget.clone();
         let account_id = self.account_id;
         let stores = Arc::clone(&self.stores);
@@ -873,6 +894,7 @@ impl WhatsAppClient {
                     shutdown,
                     reload,
                     resolve_avatars,
+                    resolve_chat_names,
                     history_budget,
                 },
             )
@@ -914,6 +936,7 @@ impl WhatsAppClient {
         account_id: AccountId,
         ui_tx: &UiEventSender,
         session: &SessionSlot,
+        resolve_chat_names: chat_names::ChatNameResolveSignal,
     ) -> Option<(Bot, Arc<Session>, ColdStart)> {
         // `began` is this function's own, and the caller's total is the
         // caller's: resolving where the database lives happens before this and
@@ -1054,6 +1077,7 @@ impl WhatsAppClient {
             client: bot.client(),
             chat_store: chat_store.clone(),
             names: Arc::new(NameBook::new(Some(chat_store))),
+            resolve_chat_names,
         });
         *session.lock().await = Some(live.clone());
         crate::exec::breathe().await;
@@ -1079,6 +1103,7 @@ impl WhatsAppClient {
             shutdown,
             reload,
             resolve_avatars,
+            resolve_chat_names,
             history_budget,
         } = shared;
         let cold_start = wacore::time::Instant::now();
@@ -1086,8 +1111,14 @@ impl WhatsAppClient {
         // one WAL writer). The registry is owned by the daemon and its schema
         // cell prevents concurrent account runtimes from rerunning migrations.
         let resolving = cold_start.elapsed();
-        let Some((bot, live, cold)) =
-            Self::open_session(&stores, account_id, &ui_tx, &session).await
+        let Some((bot, live, cold)) = Self::open_session(
+            &stores,
+            account_id,
+            &ui_tx,
+            &session,
+            resolve_chat_names.clone(),
+        )
+        .await
         else {
             return;
         };
@@ -1156,6 +1187,15 @@ impl WhatsAppClient {
                 EventKind::MissedCall,
                 EventKind::CallEndedElsewhere,
                 EventKind::GroupUpdate,
+                // Post-sync repair for the name resolver: an offline drain
+                // or a history chunk can materialize a previously unknown
+                // group/channel AFTER the Connected full-pass snapshot, and
+                // neither reaches the session handler as a live sighting —
+                // so the drain's completion re-asks for a full pass over
+                // what the store holds now.
+                EventKind::OfflineSyncCompleted,
+                EventKind::HistorySync,
+                EventKind::DeleteChatUpdate,
             ],
             64,
         );
@@ -1198,6 +1238,8 @@ impl WhatsAppClient {
             let reload = reload.clone();
             let control_fault_ui = ui_tx.clone();
             let avatar_signal = resolve_avatars.clone();
+            let names_signal = resolve_chat_names.clone();
+            let names_on_drop = resolve_chat_names.clone();
             let mut stopping = stopping.clone();
             crate::exec::spawn_owned(async move {
                 // The dispatch loop's own handle. The one below is moved into
@@ -1213,6 +1255,7 @@ impl WhatsAppClient {
                         let names = names.clone();
                         let reload = reload.clone();
                         let resolve_avatars = avatar_signal.clone();
+                        let resolve_chat_names = names_signal.clone();
                         async move {
                             Self::handle_event(
                                 event,
@@ -1222,6 +1265,7 @@ impl WhatsAppClient {
                                 names,
                                 Some(reload),
                                 Some(resolve_avatars),
+                                Some(resolve_chat_names),
                             )
                             .await;
                         }
@@ -1264,6 +1308,12 @@ impl WhatsAppClient {
                         );
                         control_drops = control_snapshot.dropped_full;
                         control_fault_ui.signal_control_overflow();
+                        // Connected and OfflineSyncCompleted are control
+                        // events. If either was among the dropped entries,
+                        // advance the name generation as well as requesting
+                        // a full durable pass, so changed subjects are not
+                        // skipped as already settled on the old socket.
+                        names_on_drop.new_connection();
                     }
                     let data_snapshot = data_stats.stats();
                     if data_snapshot.dropped_full > data_drops {
@@ -1272,6 +1322,14 @@ impl WhatsAppClient {
                             data_snapshot.dropped_full - data_drops
                         );
                         data_drops = data_snapshot.dropped_full;
+                        // The store materializes these events independently,
+                        // but the session-side sighting can be the only name
+                        // trigger for a newly seen special chat. Re-cover
+                        // durable state after a mailbox overflow without
+                        // invalidating settled names or per-chat cooldowns;
+                        // run_pass's flush barrier waits for the store's
+                        // commit first.
+                        names_on_drop.request_full();
                     }
                     // The kind, and only the kind. It is `Copy`, carries no
                     // payload and names the variant, which makes this the one
@@ -1282,9 +1340,19 @@ impl WhatsAppClient {
                     // nothing to say — the arms below speak only for the
                     // variants they handle.
                     debug!("client event: {:?}", event.kind());
-                    lanes
+                    let dropped = lanes
                         .dispatch(&dispatch_client, &dispatch_names, event)
                         .await;
+                    if dropped.dropped_recoverable {
+                        // A full lane drops only recoverable events. The
+                        // ChatStore still sees them, so a full metadata pass
+                        // recovers a name sighting we missed. Keep the exact
+                        // special-chat JIDs too: a new or unsubscribed
+                        // channel may be absent from list_subscribed and
+                        // needs the selective get_metadata fallback.
+                        names_on_drop.request_full();
+                        names_on_drop.request_named(dropped.special_chat_jids);
+                    }
                 }
             });
         }
@@ -1315,6 +1383,18 @@ impl WhatsAppClient {
             chat_store.clone(),
             ui_tx.clone(),
             resolve_avatars,
+            stopping.clone(),
+        );
+
+        // The chat-name lifecycle, kept apart from history for the same
+        // reason: a display name is server metadata, and looking it up
+        // behind a local read would delay every HistoryLoaded behind the
+        // network. Connected asks for a full pass; live traffic asks per
+        // sighted special chat; receipts and acks ask for nothing.
+        Self::spawn_chat_name_resolver(
+            bot.client(),
+            chat_store.clone(),
+            resolve_chat_names,
             stopping,
         );
 
@@ -1354,6 +1434,12 @@ impl WhatsAppClient {
     }
 
     /// Handle events from the WhatsApp client
+    ///
+    /// Eight parameters because the dispatch closure threads every signal
+    /// the arms can ask on: the reload, the avatar pass and the chat-name
+    /// pass each own a signal, and bundling three of them to save one
+    /// parameter buys the repetition back as field access at every use.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_event(
         event: Arc<Event>,
         client: Arc<Client>,
@@ -1362,6 +1448,7 @@ impl WhatsAppClient {
         names: Arc<NameBook>,
         reload: Option<Arc<tokio::sync::Notify>>,
         resolve_avatars: Option<AvatarResolveSignal>,
+        resolve_chat_names: Option<chat_names::ChatNameResolveSignal>,
     ) {
         match &*event {
             Event::RawNode(node) => calls.accept_advertisement(node).await,
@@ -1403,6 +1490,18 @@ impl WhatsAppClient {
                 if let Some(resolve) = resolve_avatars {
                     resolve.new_connection();
                 }
+                // The names, on their own signal and their own pass, for
+                // the same reason: a subject can change while the process
+                // is offline, and the previous socket's answers say nothing
+                // about this one. The pass revalidates every stored special
+                // chat; a write that learned nothing broadcasts nothing.
+                // (The pass snapshots the store when it RUNS, not when it
+                // is queued — so a drain still materializing behind this
+                // event is covered, and `OfflineSyncCompleted` below
+                // re-asks once the backlog is fully in.)
+                if let Some(resolve) = resolve_chat_names {
+                    resolve.new_connection();
+                }
                 let _ = ui_tx.send(UiEvent::Connected);
                 // Who this device is linked as. Read from the device store
                 // rather than remembered from pairing: a client attaching
@@ -1415,6 +1514,45 @@ impl WhatsAppClient {
                 // Not a Disconnected: reconnecting reuses the credentials the
                 // server just rejected, which is the 401 loop.
                 let _ = ui_tx.send(UiEvent::LoggedOut(logout_message(logged_out)));
+            }
+            Event::OfflineSyncCompleted(done) => {
+                // The backlog is fully materialized now: whatever the drain
+                // (and any history chunk behind it) created after the
+                // Connected snapshot is in the store, so re-ask for a full
+                // pass over what it holds. Coalesced by the signal — ten
+                // completions while a pass runs are one `full` bit — and a
+                // pass that learned nothing broadcasts nothing.
+                debug!("offline sync completed ({} messages)", done.count);
+                if let Some(resolve) = &resolve_chat_names {
+                    // A post-sync repair is a new durable snapshot, not just
+                    // another ask for rows already settled before the drain.
+                    // Advance the metadata generation so names overwritten by
+                    // late history are revalidated in this same connection.
+                    resolve.new_connection();
+                }
+            }
+            Event::HistorySync(history) if history.peer_data_request_session_id().is_some() => {
+                // On-demand history backfills arrive independently of the
+                // offline-drain completion. The store applies their
+                // conversation snapshots too, so revalidate metadata after
+                // the materialization rather than leaving a stale subject.
+                if let Some(resolve) = &resolve_chat_names {
+                    resolve.new_connection();
+                }
+            }
+            Event::HistorySync(_) => {
+                // Server-pushed offline chunks can arrive in many pieces;
+                // OfflineSyncCompleted is the single repair point once all
+                // of them have materialized.
+            }
+            Event::DeleteChatUpdate(update) => {
+                // A delete can retire a row after this generation already
+                // settled its metadata. The next message may recreate the
+                // row under the same JID, so force that address through a
+                // fresh metadata lookup rather than trusting the old answer.
+                if let Some(resolve) = &resolve_chat_names {
+                    resolve.request_forced([update.jid.to_non_ad_string()]);
+                }
             }
             Event::IncomingCall(call) => match &call.action {
                 CallAction::Offer {
@@ -1516,6 +1654,27 @@ impl WhatsAppClient {
                     batch.origin,
                     whatsapp_rust::wacore::types::events::BatchOrigin::Live
                 );
+                // The first sighting of an unnamed special chat: a message
+                // creates its row nameless, and no restart should be needed
+                // for the name to arrive. Sightings are cheap — the resolver
+                // deduplicates per generation and skips chats the store
+                // already names. Live traffic asks per chat; the offline
+                // drain asks once per batch (its chats may postdate the
+                // Connected snapshot, and `OfflineSyncCompleted` below is
+                // the backstop that re-covers whatever is still unnamed).
+                // Keep the ask after materialization: the resolver has its
+                // own task and could otherwise snapshot the store before this
+                // message's independent ChatStore subscription is committed.
+                let sighted = resolve_chat_names.as_ref().map(|_| {
+                    batch
+                        .iter()
+                        .filter_map(|inbound| {
+                            let chat = &inbound.info.source.chat;
+                            (chat.is_group() || chat.is_newsletter())
+                                .then(|| chat.to_non_ad_string())
+                        })
+                        .collect::<Vec<_>>()
+                });
                 for inbound in batch.iter() {
                     Self::handle_inbound_message(
                         &inbound.message,
@@ -1526,6 +1685,11 @@ impl WhatsAppClient {
                         eager,
                     )
                     .await;
+                }
+                if let (Some(resolve), Some(sighted)) = (&resolve_chat_names, sighted)
+                    && !sighted.is_empty()
+                {
+                    resolve.request_named(sighted);
                 }
             }
             Event::Receipt(receipt) => {
@@ -1989,7 +2153,13 @@ impl WhatsAppClient {
                 // Receipts/reactions arrive keyed by this id; rename the
                 // optimistic bubble before they can race it.
                 notify_message_id(&ui_sender, &jid_str, local_id, &msg_id);
-                record_outgoing(&live.chat_store, &jid, &msg_id, &message);
+                record_outgoing(
+                    &live.chat_store,
+                    &jid,
+                    &msg_id,
+                    &message,
+                    &live.resolve_chat_names,
+                );
                 let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
                 match client
                     .send_message_with_options(jid.clone(), message, options)
@@ -2145,7 +2315,13 @@ impl WhatsAppClient {
                 // the ack can't precede the row in the writer queue.
                 let msg_id = client.generate_message_id();
                 notify_message_id(&ui_sender, &jid_str, local_id, &msg_id);
-                record_outgoing(&live.chat_store, &jid, &msg_id, &message);
+                record_outgoing(
+                    &live.chat_store,
+                    &jid,
+                    &msg_id,
+                    &message,
+                    &live.resolve_chat_names,
+                );
                 let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
                 match client
                     .send_message_with_options(jid.clone(), message, options)
@@ -2281,7 +2457,13 @@ impl WhatsAppClient {
             // the ack can't precede the row in the writer queue.
             let msg_id = client.generate_message_id();
             notify_message_id(&ui_sender, &jid_str, local_id, &msg_id);
-            record_outgoing(&live.chat_store, &jid, &msg_id, &message);
+            record_outgoing(
+                &live.chat_store,
+                &jid,
+                &msg_id,
+                &message,
+                &live.resolve_chat_names,
+            );
             let options = whatsapp_rust::SendOptions::default().with_message_id(msg_id.clone());
             match client
                 .send_message_with_options(jid.clone(), message, options)
@@ -2592,7 +2774,13 @@ fn notify_send_failed(ui_sender: &UiEventSender, chat_jid: &str, message_id: &st
 
 /// Best-effort durable record of a message this client just sent; the UI's
 /// optimistic bubble is independent of this.
-fn record_outgoing(store: &ChatStore, jid: &Jid, message_id: &str, message: &wa::Message) {
+fn record_outgoing(
+    store: &ChatStore,
+    jid: &Jid,
+    message_id: &str,
+    message: &wa::Message,
+    resolve_chat_names: &chat_names::ChatNameResolveSignal,
+) {
     if let Err(e) = store.record_outgoing(
         jid,
         message_id,
@@ -2600,6 +2788,12 @@ fn record_outgoing(store: &ChatStore, jid: &Jid, message_id: &str, message: &wa:
         whatsapp_rust::wacore::time::now_utc(),
     ) {
         warn!("Failed to record outgoing message {}: {e}", message_id);
+    } else if jid.is_group() || jid.is_newsletter() {
+        // Outgoing traffic creates its row through the same writer as
+        // inbound traffic, but it does not produce an inbound Messages event
+        // on this device. Queue the sighting after the write so a newly
+        // created group/channel is resolved without waiting for a reconnect.
+        resolve_chat_names.request_named([jid.to_non_ad_string()]);
     }
 }
 

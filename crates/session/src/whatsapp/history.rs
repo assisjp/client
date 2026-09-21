@@ -426,10 +426,9 @@ impl WhatsAppClient {
                 };
                 match chat_store.chat(&parsed).await {
                     // A pin on an archived chat must not resurrect it in the
-                    // main list: the page above excludes archived rows, and
-                    // `Chat` carries no archived flag for the daemon or the
-                    // GUI to reject it with — so an incomplete load carrying
-                    // it would be upserted beside the chats it belongs with.
+                    // main list: the page above excludes archived rows. The
+                    // explicit include-archived request hydrates these rows;
+                    // an ordinary scoped reload must keep the same boundary.
                     Ok(Some(entry)) if entry.archived => {}
                     Ok(Some(entry)) => entries.push(entry),
                     // No row: the chat is live-only, or gone. Either way this
@@ -603,6 +602,13 @@ impl WhatsAppClient {
                 if entry.pinned_at > existing.pinned_at {
                     existing.pinned_at = entry.pinned_at;
                 }
+                if entry.muted_until > existing.muted_until {
+                    existing.muted_until = entry.muted_until;
+                }
+                // `entries` are in display order; the first alias is the
+                // row this logical thread is represented by. A stale second
+                // PN/LID row must not make an unarchived primary row archived
+                // again merely because aliases are being collapsed.
                 existing.set_name_if_better(name, name_priority);
                 continue;
             }
@@ -610,6 +616,8 @@ impl WhatsAppClient {
             // later complete load no longer returns it.
             let mut chat = oxidezap_core::Chat::from_store(jid_str.clone(), name, name_priority);
             chat.pinned_at = entry.pinned_at;
+            chat.muted_until = entry.muted_until;
+            chat.archived = entry.archived;
             chat.unread_count = entry.unread_count.max(0) as u32;
             // -1 = manually marked unread (WA Web convention); .max(0) above
             // must not silently eat the flag.

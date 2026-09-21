@@ -140,8 +140,11 @@ pub(super) struct DispatchOutcome {
     pub(super) special_chat_jids: Vec<String>,
 }
 
-fn recoverable(event: &Event) -> bool {
-    matches!(event, Event::Messages(_) | Event::Receipt(_))
+pub(super) fn recoverable(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Messages(_) | Event::ServerAck(_) | Event::Receipt(_)
+    )
 }
 
 /// One event per subject it is about, which for everything but a batch of
@@ -248,6 +251,7 @@ pub(super) fn event_subject(event: &Event) -> Option<Subject> {
             .iter()
             .next()
             .map(|inbound| Subject::Chat(inbound.info.source.chat.clone())),
+        Event::ServerAck(ack) => ack.from.clone().map(Subject::Chat),
         Event::Receipt(receipt) => Some(Subject::Chat(receipt.source.chat.clone())),
         Event::ChatPresence(update) => Some(Subject::Chat(update.source.chat.clone())),
         // Both name somebody, and both handlers go to the store for a name or

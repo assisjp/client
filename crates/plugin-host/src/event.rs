@@ -100,11 +100,26 @@ impl Event {
 pub fn from_session(event: &UiEvent) -> Option<Event> {
     use fields::{call, connection, media, receipt};
 
+    // `Sent` is the session's live projection of a server acknowledgement,
+    // not a peer receipt. The plugin ABI's weakest receipt means "reached the
+    // device", so translating this as Delivered would overstate the event and
+    // then publish the real delivery a second time.
+    if matches!(
+        event,
+        UiEvent::ReceiptReceived {
+            receipt_type: oxidezap_core::ReceiptType::Sent,
+            ..
+        }
+    ) {
+        return None;
+    }
+
     Some(match event {
         UiEvent::MessageReceived {
             chat_jid,
             message,
             sender_name,
+            ..
         } => Event::new(abi::kinds::MESSAGE)
             .str(fields::CHAT_JID, chat_jid.clone())
             .flag(fields::IS_GROUP, is_group(chat_jid))
@@ -291,6 +306,15 @@ pub fn from_session(event: &UiEvent) -> Option<Event> {
 /// `every_converted_event_is_one_the_filter_admits` holds.
 #[must_use]
 pub fn kind_of(event: &UiEvent) -> Option<i32> {
+    if matches!(
+        event,
+        UiEvent::ReceiptReceived {
+            receipt_type: oxidezap_core::ReceiptType::Sent,
+            ..
+        }
+    ) {
+        return None;
+    }
     Some(match event {
         UiEvent::MessageReceived { .. } => abi::kinds::MESSAGE,
         UiEvent::InitComplete
@@ -339,6 +363,9 @@ mod tests {
             chat_jid: chat.into(),
             message: Box::new(message),
             sender_name: None,
+            notification_allowed: false,
+            notification_title: None,
+            notification_archived: false,
         }
     }
 

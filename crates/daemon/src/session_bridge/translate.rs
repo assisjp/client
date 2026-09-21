@@ -297,7 +297,15 @@ impl Bridge {
                 chat_jid,
                 message,
                 sender_name,
+                ..
             } => {
+                // A complete store load removed this JID from the active
+                // list. Do not resurrect it from live traffic while the
+                // store is deciding whether the message unarchived/recreated
+                // it; a store-backed ChatUpdated clears the marker shortly.
+                if self.hub.chat(&chat_jid).is_none() && self.hub.chat_is_inactive(&chat_jid) {
+                    return Vec::new();
+                }
                 let mut summary = self.hub.chat(&chat_jid).unwrap_or_else(|| ChatSummary {
                     name: live_chat_name(&chat_jid, &message, sender_name),
                     jid: chat_jid.clone(),

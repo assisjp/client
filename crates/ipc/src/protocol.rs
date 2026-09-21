@@ -6,6 +6,10 @@ use oxidezap_core::{
 };
 use serde::{Deserialize, Serialize};
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Monotonic counter over daemon state.
 ///
 /// Only ever increases, and only the daemon advances it. Clients compare but
@@ -833,6 +837,10 @@ pub struct LoadChats {
     pub after: Option<PageCursor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+    /// Include archived rows in this page. The caller still decides whether
+    /// to draw only archived rows or an all-inclusive export.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub archived: bool,
 }
 
 /// The group whose members are being asked for. See
@@ -1880,6 +1888,7 @@ mod tests {
                 ClientRequest::LoadChats(LoadChats {
                     after: Some(PageCursor::new("c1:1700000000123")),
                     limit: Some(20),
+                    archived: false,
                 }),
                 r#"{"request":"load_chats","after":"c1:1700000000123","limit":20}"#.to_string(),
             ),
@@ -1887,8 +1896,17 @@ mod tests {
                 ClientRequest::LoadChats(LoadChats {
                     after: None,
                     limit: None,
+                    archived: false,
                 }),
                 r#"{"request":"load_chats"}"#.to_string(),
+            ),
+            (
+                ClientRequest::LoadChats(LoadChats {
+                    after: None,
+                    limit: None,
+                    archived: true,
+                }),
+                r#"{"request":"load_chats","archived":true}"#.to_string(),
             ),
             (
                 ClientRequest::GroupMembers(GroupMembers {

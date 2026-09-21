@@ -84,7 +84,22 @@ mod imp {
     /// worth being able to choose it from the URL when a machine's WebGPU is the
     /// thing that is broken.
     pub(super) fn application() -> gpui::Application {
-        gpui_platform::application()
+        gpui_platform::application().with_quit_mode(quit_mode())
+    }
+
+    /// A desktop window is the GUI process. The daemon owns the persistent
+    /// session and tray, so leaving a windowless GUI alive only retains stale
+    /// IPC window ownership. GPUI's default is explicit quit on macOS.
+    pub(super) const fn quit_mode() -> gpui::QuitMode {
+        gpui::QuitMode::LastWindowClosed
+    }
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod tests {
+    #[test]
+    fn desktop_quits_when_its_last_window_closes() {
+        assert_eq!(super::imp::quit_mode(), gpui::QuitMode::LastWindowClosed);
     }
 }
 

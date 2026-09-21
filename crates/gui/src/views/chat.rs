@@ -74,6 +74,7 @@ pub fn render_connected_view(
     // visible than a chat on another screen.
     let visible = (app.destination() == Destination::Chats
         && layout.show_chat_area()
+        && !app.paste_preview_showing()
         && app.media_viewer(cx).is_none())
     .then(|| selected_jid.clone())
     .flatten();
@@ -102,7 +103,7 @@ pub fn render_connected_view(
     // unread chat — can be on a page nobody has fetched. An empty list is at
     // its end by definition, so it asks like any other list that is; the
     // paging state is what stops it asking twice, and `Done` is what ends it.
-    if app.chat_list_is_empty(cx) {
+    if app.chat_list_is_empty(cx) || app.is_searching(cx) {
         app.want_more_chats(cx);
     }
 
@@ -245,6 +246,7 @@ pub fn render_connected_view(
             && open_chat.is_some()
             && !is_offline,
         viewer: viewer.is_some(),
+        paste_preview: false,
         // The card floats above this view rather than inside it, so the root
         // is what knows whether one was drawn. See `WhatsAppApp::render`.
         call_card: false,

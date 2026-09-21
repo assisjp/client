@@ -100,8 +100,10 @@ pub(crate) fn chat_to_dto(chat: oxidezap_core::Chat) -> ChatDto {
         manually_unread: chat.manually_unread,
         is_group: chat.is_group,
         is_pinned: chat.pinned_at.is_some(),
-        is_muted: false,
-        is_archived: false,
+        is_muted: chat
+            .muted_until
+            .is_some_and(|until| until > wacore::time::now_utc()),
+        is_archived: chat.archived,
         last_message_ts: chat.last_message_time.map(|t| t.timestamp_millis()),
         last_message_preview: chat.last_message,
     }
@@ -293,6 +295,9 @@ mod tests {
                 chat_jid: "559900000001@s.whatsapp.net".into(),
                 message: Box::new(message),
                 sender_name: None,
+                notification_allowed: false,
+                notification_title: None,
+                notification_archived: false,
             }),
         })
         .unwrap();

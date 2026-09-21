@@ -141,6 +141,12 @@ struct Inner {
     /// Chats keyed by JID. A map, not a Vec: every update is a lookup by JID,
     /// and a Vec would make a rename or a receipt O(n) over every chat.
     chats: std::collections::HashMap<String, ChatEntry>,
+    /// Chats the active store list removed (archived or deleted).
+    ///
+    /// A live message for one must not recreate an active snapshot row before
+    /// the store has said whether it was unarchived. The next store-backed
+    /// update clears the marker; account departure clears the whole set.
+    inactive_chats: std::collections::HashSet<String>,
     /// Which account this is, counted up every time one leaves.
     ///
     /// Here rather than beside the lock, so a task that asks and then applies
@@ -195,6 +201,7 @@ impl StateStore {
                 account: None,
                 plugins: Vec::new(),
                 chats: std::collections::HashMap::new(),
+                inactive_chats: std::collections::HashSet::new(),
                 account_generation: 0,
             }),
         }
@@ -253,6 +260,7 @@ impl StateStore {
     pub(super) fn forget_account(&self) {
         let mut inner = self.lock();
         inner.chats.clear();
+        inner.inactive_chats.clear();
         inner.account = None;
         inner.calls = oxidezap_core::CallState::new();
         inner.version = inner.version.next();
@@ -287,6 +295,11 @@ impl StateStore {
     /// The summary held for `jid`, if any.
     pub(super) fn chat(&self, jid: &str) -> Option<ChatSummary> {
         self.lock().chats.get(jid).map(|e| e.summary.clone())
+    }
+
+    /// Whether the active store list deliberately excluded this chat.
+    pub(super) fn chat_is_inactive(&self, jid: &str) -> bool {
+        self.lock().inactive_chats.contains(jid)
     }
 
     /// The JIDs a complete store reload is allowed to contradict.
@@ -334,25 +347,31 @@ impl StateStore {
 
         match &event {
             DaemonEvent::ConnectionChanged(state) => inner.connection = state.clone(),
-            DaemonEvent::ChatUpdated(summary) => match inner.chats.entry(summary.jid.clone()) {
-                std::collections::hash_map::Entry::Occupied(mut slot) => {
-                    let entry = slot.get_mut();
-                    entry.summary = summary.clone();
-                    // Sticky: a live update to a chat the store has already
-                    // published must not make it live-only again, or a
-                    // deletion elsewhere would stop being prunable the moment
-                    // one more message arrived.
-                    entry.from_store |= from_store;
+            DaemonEvent::ChatUpdated(summary) => {
+                if from_store {
+                    inner.inactive_chats.remove(&summary.jid);
                 }
-                std::collections::hash_map::Entry::Vacant(slot) => {
-                    slot.insert(ChatEntry {
-                        summary: summary.clone(),
-                        from_store,
-                    });
+                match inner.chats.entry(summary.jid.clone()) {
+                    std::collections::hash_map::Entry::Occupied(mut slot) => {
+                        let entry = slot.get_mut();
+                        entry.summary = summary.clone();
+                        // Sticky: a live update to a chat the store has already
+                        // published must not make it live-only again, or a
+                        // deletion elsewhere would stop being prunable the moment
+                        // one more message arrived.
+                        entry.from_store |= from_store;
+                    }
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(ChatEntry {
+                            summary: summary.clone(),
+                            from_store,
+                        });
+                    }
                 }
-            },
+            }
             DaemonEvent::ChatRemoved { jid } => {
                 inner.chats.remove(jid);
+                inner.inactive_chats.insert(jid.clone());
             }
             // Not the usual route in — [`Self::change_calls`] is — but the
             // state it names is the state this holds, so applying it here

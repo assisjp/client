@@ -324,6 +324,7 @@ fn render_empty(
         EmptyState::new(match props.filter {
             ChatFilter::Unread => "Nothing unread",
             ChatFilter::Groups => "No groups",
+            ChatFilter::Archived => "No archived chats",
             ChatFilter::All => "No chats",
         })
         .icon(IconName::Inbox)

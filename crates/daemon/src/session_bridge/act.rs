@@ -192,7 +192,12 @@ impl Bridge {
             }
             Action::LoadChats {
                 id,
-                request: oxidezap_ipc::LoadChats { after, limit },
+                request:
+                    oxidezap_ipc::LoadChats {
+                        after,
+                        limit,
+                        archived,
+                    },
                 answer_to,
             } => {
                 // As above: the permit is what decides whether the query
@@ -204,7 +209,7 @@ impl Bridge {
                 let page = client.load_chats(
                     after.map(|cursor| cursor.as_str().to_string()),
                     limit.map_or(WhatsAppClient::CHAT_PAGE, i64::from),
-                    false,
+                    archived,
                 );
                 let reads = Arc::clone(&self.reads);
                 let hub = Arc::clone(&self.hub);
@@ -234,6 +239,23 @@ impl Bridge {
                                     reads.lock().unwrap_or_else(|held| held.into_inner());
                                 for message in &chat.messages {
                                     reads.observe_message(&chat.jid, message);
+                                }
+                                // The hub is the active-list snapshot handed
+                                // to newly attached windows. An explicit
+                                // include-archived page belongs only to the
+                                // requesting window; publishing its archived
+                                // rows here would resurrect them as ordinary
+                                // placeholder chats on the next attach.
+                                if chat.archived {
+                                    if !hub.apply_for(
+                                        asked_as,
+                                        Change::from_store(DaemonEvent::ChatRemoved {
+                                            jid: chat.jid.clone(),
+                                        }),
+                                    ) {
+                                        reads.forget(&chat.jid);
+                                    }
+                                    continue;
                                 }
                                 // Asked and written under one lock, so a
                                 // logout cannot land between the question and

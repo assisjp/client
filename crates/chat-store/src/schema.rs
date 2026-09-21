@@ -13,6 +13,8 @@ diesel::table! {
         ephemeral_expiration -> Nullable<Integer>,
         read_boundary_ms -> BigInt,
         read_boundary_ids -> Nullable<Text>,
+        mute_appstate_seen -> Bool,
+        archive_appstate_seen -> Bool,
     }
 }
 

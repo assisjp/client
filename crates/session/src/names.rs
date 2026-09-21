@@ -35,7 +35,7 @@ use oxidezap_core::fallback_chat_name;
 use whatsapp_rust::anyhow::Result;
 use whatsapp_rust::client::Client;
 use whatsapp_rust::lid_pn_cache::LidPnEntry;
-use whatsapp_rust::wacore_binary::jid::Jid;
+use whatsapp_rust::wacore_binary::jid::{Jid, JidExt};
 
 use crate::exec::MaybeSend;
 
@@ -138,6 +138,13 @@ impl NameBook {
         }
     }
 
+    /// The same durable store the live path uses for names and chat policy.
+    /// History-only and synthetic call fixtures have none; alert decisions
+    /// from those paths are unknown, never implicitly allowed.
+    pub(crate) fn chat_store(&self) -> Option<&ChatStore> {
+        self.chat_store.as_deref()
+    }
+
     /// Drop everything learned. Called where the address book is being
     /// re-read anyway, so a contact renamed on the phone appears under its
     /// new name without a restart.
@@ -223,7 +230,9 @@ impl NameBook {
             }
         }
 
-        if let Some(name) = offered.filter(|name| usable_name(name, identity.has_phone)) {
+        if let Some(name) =
+            offered.filter(|name| usable_offered_name(jid, name, identity.has_phone))
+        {
             return (name.to_string(), priority::SELF_CHOSEN);
         }
 
@@ -345,6 +354,21 @@ async fn build_identity<S: LidPnSource + ?Sized>(client: &S, jid: &Jid) -> ChatI
 /// since a name only ever gains weight.
 fn usable_name(name: &str, has_phone: bool) -> bool {
     !(name.trim().is_empty() || has_phone && is_masked_phone_label(name))
+}
+
+/// Whether a name carried by a stored chat is a real user/server answer.
+///
+/// Group rows created by older builds could persist the UI fallback as if it
+/// were a subject. Treat both generations of that fallback as unresolved so
+/// history does not give them `SELF_CHOSEN` priority and block metadata repair.
+/// The rule is deliberately scoped to groups: a person may legitimately name a
+/// direct chat "Group name unavailable".
+fn usable_offered_name(jid: &Jid, name: &str, has_phone: bool) -> bool {
+    usable_name(name, has_phone) && !is_generated_group_placeholder(jid, name)
+}
+
+fn is_generated_group_placeholder(jid: &Jid, name: &str) -> bool {
+    jid.is_group() && matches!(name.trim(), "Unnamed group" | "Group name unavailable")
 }
 
 /// The server's own stand-in for a number it will not spell out, e.g.
@@ -533,6 +557,26 @@ mod tests {
         // Nothing better is known, so the mask is all there is.
         assert!(usable_name("+55 ·· ···· ··43", false));
         assert!(usable_name("Ana", true));
+    }
+
+    #[test]
+    fn generated_group_labels_are_not_taken_from_history_as_self_chosen() {
+        let group = jid(GROUP);
+
+        assert!(!usable_offered_name(&group, "Unnamed group", false));
+        assert!(!usable_offered_name(
+            &group,
+            "Group name unavailable",
+            false
+        ));
+        assert!(usable_offered_name(&group, "Trip planning", false));
+        // The same text is still a valid custom label for a direct chat; the
+        // placeholder rule is scoped to group conversations.
+        assert!(usable_offered_name(
+            &jid(PEER),
+            "Group name unavailable",
+            false
+        ));
     }
 
     #[test]

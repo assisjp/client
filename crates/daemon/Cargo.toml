@@ -153,6 +153,8 @@ tray-icon = { version = "0.24", default-features = false }
 # graph transitively; declared because this crate imports it directly.
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.9"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSRunningApplication"] }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }

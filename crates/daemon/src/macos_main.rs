@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use core_foundation::runloop::{CFRunLoop, kCFRunLoopDefaultMode};
+use objc2::MainThreadMarker;
+use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 
 use crate::state::StateHub;
 use crate::tray::macos::MacTray;
@@ -23,6 +25,16 @@ use crate::tray::macos::MacTray;
 /// way it is on a bare window manager — and the runloop is pumped either
 /// way, so the two paths cannot drift.
 pub fn run(runtime: tokio::runtime::Runtime, hub: Arc<StateHub>) -> Result<()> {
+    // The daemon owns an AppKit status item, not a user-facing application.
+    // `LSUIElement` is the launch-time declaration; setting the same policy
+    // explicitly also covers the unbundled executable the GUI starts and
+    // prevents AppKit from briefly registering a second Dock application.
+    let mtm = MainThreadMarker::new().context("the macOS daemon is not on the main thread")?;
+    let app = NSApplication::sharedApplication(mtm);
+    if !app.setActivationPolicy(NSApplicationActivationPolicy::Accessory) {
+        log::warn!("AppKit refused the accessory activation policy; a Dock icon may appear");
+    }
+
     let mut tray = match MacTray::start(&hub) {
         Ok(tray) => Some(tray),
         Err(e) => {

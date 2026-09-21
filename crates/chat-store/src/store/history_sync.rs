@@ -110,17 +110,27 @@ fn apply_history_conversation(
             ))
             .on_conflict((dsl::device_id, dsl::jid))
             .do_update()
-            // Live rows already track unread/mute/pin; history only refreshes
-            // identity + activity floor. A nameless chunk preserves an
-            // existing name rather than clobbering it with NULL; a named one
-            // still updates. Two statements rather than one, because the SET
-            // clause is static and the two cases write different columns.
+            // A live message can create the row before the phone's history
+            // snapshot has supplied its mute/archive preferences. History
+            // keeps refreshing those until an explicit app-state update has
+            // spoken for each one; then even false/NULL is newer authority
+            // than a delayed snapshot. Unread/pin remain owned by live state.
+            // A nameless chunk preserves an existing name rather than
+            // clobbering it with NULL; a named one still updates.
             .set((
                 dsl::name.eq(diesel::dsl::sql::<
                     diesel::sql_types::Nullable<diesel::sql_types::Text>,
                 >("COALESCE(excluded.name, name)")),
                 dsl::last_message_ts.eq(diesel::dsl::sql::<diesel::sql_types::BigInt>(
                     "MAX(last_message_ts, excluded.last_message_ts)",
+                )),
+                dsl::muted_until.eq(diesel::dsl::sql::<
+                    diesel::sql_types::Nullable<diesel::sql_types::BigInt>,
+                >(
+                    "CASE WHEN mute_appstate_seen THEN muted_until ELSE excluded.muted_until END",
+                )),
+                dsl::archived.eq(diesel::dsl::sql::<diesel::sql_types::Bool>(
+                    "CASE WHEN archive_appstate_seen THEN archived ELSE excluded.archived END",
                 )),
             ))
             .execute(conn)?;

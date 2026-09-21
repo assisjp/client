@@ -220,8 +220,10 @@ pub(super) fn ensure_chat(
 /// rows have already moved). Activity and preview re-derive from the merged
 /// messages; the self-read state is the union of both sides so neither
 /// side's covered messages re-badge; sticky user prefs (pin/mute/archive,
-/// name, ephemeral) keep dest's value and fall back to src's. A manual-unread
-/// marker on either side survives; otherwise the badge is recounted.
+/// name, ephemeral) keep dest's value and fall back to src's. For mute and
+/// archive, an explicit app-state answer (including unmute/unarchive) beats a
+/// history-only value from the other alias. A manual-unread marker on either
+/// side survives; otherwise the badge is recounted.
 pub(crate) fn merge_chat_metadata(
     conn: &mut SqliteConnection,
     device_id: i32,
@@ -237,6 +239,8 @@ pub(crate) fn merge_chat_metadata(
         bool,
         Option<i32>,
         Option<String>,
+        bool,
+        bool,
     );
     let prefs = |conn: &mut SqliteConnection, key: &str| -> QueryResult<Option<PrefRow>> {
         chat_row(device_id, key)
@@ -248,6 +252,8 @@ pub(crate) fn merge_chat_metadata(
                 dsl::archived,
                 dsl::ephemeral_expiration,
                 dsl::name,
+                dsl::mute_appstate_seen,
+                dsl::archive_appstate_seen,
             ))
             .first(conn)
             .optional()
@@ -257,7 +263,8 @@ pub(crate) fn merge_chat_metadata(
     };
     let src_state = read_state(conn, device_id, src)?;
     ensure_chat(conn, device_id, dest)?;
-    let dest_row = prefs(conn, dest)?.unwrap_or((0, 0, None, None, false, None, None));
+    let dest_row =
+        prefs(conn, dest)?.unwrap_or((0, 0, None, None, false, None, None, false, false));
     let dest_state = read_state(conn, device_id, dest)?;
 
     let mut merged = ReadState {
@@ -277,15 +284,36 @@ pub(crate) fn merge_chat_metadata(
     } else {
         count_unread(conn, device_id, dest, &merged)?
     };
+    // A split pair may have received an app-state action on only one side.
+    // Preserve that explicit answer even when it is false/NULL; otherwise
+    // keep the established sticky fallback between history-only rows. If
+    // both sides have explicit answers, the surviving (more active) row wins
+    // as it did before this provenance was tracked.
+    let muted_until = if dest_row.7 {
+        dest_row.3
+    } else if src_row.7 {
+        src_row.3
+    } else {
+        dest_row.3.or(src_row.3)
+    };
+    let archived = if dest_row.8 {
+        dest_row.4
+    } else if src_row.8 {
+        src_row.4
+    } else {
+        dest_row.4 || src_row.4
+    };
     diesel::update(chat_row(device_id, dest))
         .set((
             dsl::last_message_ts.eq(src_row.0.max(dest_row.0)),
             dsl::unread_count.eq(unread),
             dsl::pinned_at.eq(dest_row.2.or(src_row.2)),
-            dsl::muted_until.eq(dest_row.3.or(src_row.3)),
-            dsl::archived.eq(dest_row.4 || src_row.4),
+            dsl::muted_until.eq(muted_until),
+            dsl::archived.eq(archived),
             dsl::ephemeral_expiration.eq(dest_row.5.or(src_row.5)),
             dsl::name.eq(dest_row.6.or(src_row.6)),
+            dsl::mute_appstate_seen.eq(dest_row.7 || src_row.7),
+            dsl::archive_appstate_seen.eq(dest_row.8 || src_row.8),
             dsl::read_boundary_ms.eq(merged.watermark_ms),
             dsl::read_boundary_ids.eq(ids_json),
         ))

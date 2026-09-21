@@ -177,6 +177,8 @@ pub enum FromDaemon {
         chats: Vec<Chat>,
         /// Where to continue, or `None` at the end of the list.
         next: Option<PageCursor>,
+        /// Whether this page came from the include-archived list.
+        archived: bool,
     },
     /// Who is in a group, for the header that asked.
     Members(oxidezap_core::GroupRoster),
@@ -195,6 +197,8 @@ pub enum FromDaemon {
     PageLost {
         /// The conversation, or `None` for a page of the chat list.
         jid: Option<String>,
+        /// Which chat-list cursor owns the request; false for timelines.
+        archived: bool,
     },
     /// A picture is waiting in [`Session::call_frames`].
     ///
@@ -354,6 +358,8 @@ enum Awaiting {
     Page {
         /// The conversation, or `None` for a page of the chat list.
         jid: Option<String>,
+        /// Which chat-list cursor owns the request; false for timelines.
+        archived: bool,
     },
 }
 
@@ -443,10 +449,10 @@ impl Awaiting {
             }
             // The view that asked is waiting on this and will not ask again
             // until it hears something.
-            Self::Page { jid } => {
+            Self::Page { jid, archived } => {
                 log::warn!("a page of history did not arrive: {detail}");
                 if let Some(events) = events {
-                    let _ = events.send(FromDaemon::PageLost { jid });
+                    let _ = events.send(FromDaemon::PageLost { jid, archived });
                 }
             }
             // Same rule as a page, and the same consequence: a header that
@@ -1318,15 +1324,25 @@ impl SessionHandle {
                 // opinion about it would be guessing.
                 limit: None,
             }),
-            Awaiting::Page { jid: Some(jid) },
+            Awaiting::Page {
+                jid: Some(jid),
+                archived: false,
+            },
         );
     }
 
     /// Ask for one page of the chat list, after `after`.
-    pub fn load_chats(&self, after: Option<PageCursor>) {
+    pub fn load_chats(&self, after: Option<PageCursor>, archived: bool) {
         self.ask(
-            ClientRequest::LoadChats(LoadChats { after, limit: None }),
-            Awaiting::Page { jid: None },
+            ClientRequest::LoadChats(LoadChats {
+                after,
+                limit: None,
+                archived,
+            }),
+            Awaiting::Page {
+                jid: None,
+                archived,
+            },
         );
     }
 
@@ -1887,9 +1903,9 @@ fn fail_reserved(conn: &Conn, id: RequestId, detail: String) {
         // waiting on a page asks for nothing until it hears, so a request
         // that never left has to say so — the reconnect keeps the chats and
         // the paging state, and a list left `Loading` never asks again.
-        Awaiting::Page { jid } => {
+        Awaiting::Page { jid, archived } => {
             error!("a page request never left this process: {detail}");
-            let _ = conn.events.try_send(FromDaemon::PageLost { jid });
+            let _ = conn.events.try_send(FromDaemon::PageLost { jid, archived });
         }
         // And again, for the header's line: it is holding this request open.
         Awaiting::Members { jid } => {

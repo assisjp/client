@@ -28,6 +28,9 @@ pub(super) fn received(chat_jid: &str, message: ChatMessage, sender_name: Option
         chat_jid: chat_jid.into(),
         message: Box::new(message),
         sender_name: sender_name.map(str::to_string),
+        notification_allowed: false,
+        notification_title: None,
+        notification_archived: false,
     }
 }
 

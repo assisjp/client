@@ -77,6 +77,7 @@ use log::{debug, error, info, warn};
 use oxidezap_chat_store::ChatStore;
 use portable_atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, mpsc};
+use whatsapp_rust::PresencePolicy;
 use whatsapp_rust::bot::Bot;
 use whatsapp_rust::client::Client;
 // The same type either way; only the road to it differs. On a desktop the
@@ -108,6 +109,23 @@ use crate::quoting::quoted_from;
 use crate::video::{self, CameraLost, PictureLost, VideoPublisher, VideoSenderSlot};
 use whatsapp_rust::voip::KeyframeUrgency;
 use whatsapp_rust::wacore::download::MediaType as DownloadMediaType;
+
+/// Configure the WhatsApp client as a persistent background companion.
+///
+/// Automatic presence matches a browser tab: it announces `available` on
+/// every connection. This process outlives every window, so that announcement
+/// would make WhatsApp route new-message attention away from the phone.
+fn persistent_companion<B, T, H, R>(
+    builder: whatsapp_rust::bot::BotBuilder<B, T, H, R>,
+) -> whatsapp_rust::bot::BotBuilder<B, T, H, R> {
+    builder.with_presence_policy(PresencePolicy::Manual)
+}
+
+/// Retract a stale `available` announcement left on the server by an older
+/// client version, as soon as each new connection is ready to send.
+async fn announce_background_presence(client: &Client) -> Result<(), whatsapp_rust::PresenceError> {
+    client.presence().set_unavailable().await
+}
 
 use crate::store::StoreRegistry;
 
@@ -150,6 +168,20 @@ fn interested_channel(
         inner,
     )
 }
+
+/// Durable data changes whose live projection keeps an open conversation
+/// current while the history reloader coalesces store invalidations.
+const DATA_EVENT_KINDS: &[EventKind] = &[
+    EventKind::Messages,
+    // A positive message ack is the first delivery state of an optimistic
+    // send. The store also persists it, but its history reloader waits for a
+    // quiet window that a continuous sync may not reach; carry the tick live
+    // as a Sent receipt.
+    EventKind::ServerAck,
+    EventKind::Receipt,
+    EventKind::ChatPresence,
+    EventKind::Presence,
+];
 
 /// Where the store lives on this platform. See [`crate::store`].
 pub use crate::store::{database_path as resolve_database_path, prepare as prepare_store};
@@ -1032,7 +1064,7 @@ impl WhatsAppClient {
         // override makes the library skip its own resolution *and* the
         // day-long cache stamp behind it.
         let building = wacore::time::Instant::now();
-        let builder = crate::net::with_platform_plugins(Bot::builder())
+        let builder = persistent_companion(crate::net::with_platform_plugins(Bot::builder()))
             .with_backend(backend)
             .with_inbound_durability_hook(ChatStoreDurabilityHook::new(chat_store.clone()));
         let bot = match builder.build().await {
@@ -1199,15 +1231,7 @@ impl WhatsAppClient {
             ],
             64,
         );
-        let (data_events, data_incoming, data_stats) = interested_channel(
-            &[
-                EventKind::Messages,
-                EventKind::Receipt,
-                EventKind::ChatPresence,
-                EventKind::Presence,
-            ],
-            256,
-        );
+        let (data_events, data_incoming, data_stats) = interested_channel(DATA_EVENT_KINDS, 256);
         // What tells this session's own tasks that it is over.
         //
         // A desktop session ends by dropping the runtime it was built on,
@@ -1477,6 +1501,13 @@ impl WhatsAppClient {
             }
             Event::Connected(_) => {
                 info!("Connected to WhatsApp!");
+                // Manual policy prevents future automatic `available`
+                // announcements. Retract any presence left on the server by
+                // an older build or a previous connection as soon as this
+                // socket is ready.
+                if let Err(error) = announce_background_presence(&client).await {
+                    warn!("could not announce background presence: {error}");
+                }
                 if let Some(reload) = reload {
                     reload.notify_one();
                 }
@@ -1691,6 +1722,34 @@ impl WhatsAppClient {
                 {
                     resolve.request_named(sighted);
                 }
+            }
+            Event::ServerAck(ack) => {
+                // Acks cover every stanza class, and a nack is explicitly not
+                // a successful send. The chat store handles both durably; the
+                // live path only supplies the positive message transition the
+                // optimistic bubble can draw immediately.
+                if ack.class.as_deref() != Some("message") || ack.error.is_some() {
+                    return;
+                }
+                let Some(from) = &ack.from else {
+                    // A chatless ack can be resolved safely by the store
+                    // against its outgoing rows, but this stateless path
+                    // cannot guess which conversation owns the id.
+                    return;
+                };
+                let Some(chat_jid) = names.chat_key(&client, from).await else {
+                    warn!(
+                        "dropping sent acknowledgement for {}: the PN/LID pair behind it could not be read",
+                        from.observe()
+                    );
+                    return;
+                };
+
+                let _ = ui_tx.send(UiEvent::ReceiptReceived {
+                    chat_jid,
+                    message_ids: vec![ack.id.clone()],
+                    receipt_type: ReceiptType::Sent,
+                });
             }
             Event::Receipt(receipt) => {
                 // Delivered used to be dropped here, which is why the
@@ -2079,10 +2138,67 @@ impl WhatsAppClient {
                 .await
         };
 
+        // The inbound durability hook commits a live batch before this event
+        // is dispatched, so the store is the authority even for its *first*
+        // message. GUI hydration is paged and can lag this event (or omit an
+        // archived chat entirely); its in-memory Chat cannot decide mute or
+        // archive policy. Offline drains are history, not new attention.
+        // Only the protocol's explicit mention list counts. WhatsApp lets a
+        // personal @mention through a group's mute/archive settings, but an
+        // ordinary `@` in prose must not bypass them.
+        let mentions_me = info.source.chat.is_group()
+            && !info.source.is_from_me
+            && crate::mentions::mentions_own_account(Some(msg), &history::own_jids(client));
+        let (notification_allowed, notification_title, notification_archived) = if eager {
+            if let Some(store) = names.chat_store() {
+                match store.notification_metadata(&info.source.chat).await {
+                    Ok(Some(metadata)) => {
+                        let allowed = metadata.allowed || mentions_me;
+                        let title = if allowed {
+                            let identity = names.identity(client, &info.source.chat).await;
+                            let (title, priority) = names
+                                .resolve(
+                                    store,
+                                    &info.source.chat,
+                                    metadata.name.as_deref(),
+                                    &identity,
+                                )
+                                .await;
+                            if mentions_me {
+                                let group = if priority > 0 {
+                                    title.as_str()
+                                } else {
+                                    "group"
+                                };
+                                Some(format!("Mentioned in {group}"))
+                            } else {
+                                (priority > 0).then_some(title)
+                            }
+                        } else {
+                            None
+                        };
+                        (allowed, title, metadata.archived)
+                    }
+                    Ok(None) => (false, None, false),
+                    Err(error) => {
+                        warn!("could not read chat notification policy: {error}");
+                        (false, None, false)
+                    }
+                }
+            } else {
+                (false, None, false)
+            }
+        } else {
+            (false, None, false)
+        };
+
         let _ = ui_tx.send(UiEvent::MessageReceived {
             chat_jid,
             message: Box::new(chat_message),
             sender_name,
+            notification_allowed,
+            notification_title,
+            notification_archived,
         });
     }
 

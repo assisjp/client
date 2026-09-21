@@ -357,6 +357,163 @@ mod tests {
         .unwrap();
     }
 
+    fn one_pixel_png() -> Vec<u8> {
+        vec![
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
+            8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 248, 207,
+            192, 240, 31, 0, 3, 3, 1, 0, 24, 251, 3, 253, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96,
+            130,
+        ]
+    }
+
+    fn paste_preview_fixture(
+        cx: &mut gpui::TestAppContext,
+    ) -> (gpui::VisualTestContext, Entity<WhatsAppApp>) {
+        use gpui::{ClipboardItem, Image, ImageFormat};
+
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            init_app_bindings(cx);
+        });
+        let mut app_entity = None;
+        let window = cx.open_window(gpui::size(gpui::px(1000.), gpui::px(800.)), |window, cx| {
+            let app = cx.new(|cx| {
+                let mut app = WhatsAppApp::new(cx);
+                app.app_state = AppState::Connected;
+                app.destination = Destination::Chats;
+                app.chats
+                    .push(Arc::new(Chat::new("peer@example.invalid".into())));
+                app
+            });
+            app_entity = Some(app.clone());
+            gpui_component::Root::new(app, window, cx)
+        });
+        let app = app_entity.unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            app.update(cx, |app, cx| {
+                app.select_chat(
+                    "peer@example.invalid".into(),
+                    ChatOpen::ToCompose,
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        cx.write_to_clipboard(ClipboardItem::new_image(&Image {
+            format: ImageFormat::Png,
+            bytes: one_pixel_png(),
+            id: 0,
+        }));
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-v"
+        } else {
+            "ctrl-v"
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        (cx, app)
+    }
+
+    #[gpui::test]
+    fn pasted_image_waits_in_a_visible_preview(cx: &mut gpui::TestAppContext) {
+        let (mut cx, app) = paste_preview_fixture(cx);
+
+        cx.read(|cx| {
+            let app = app.read(cx);
+            assert!(
+                app.attachment_attempts.is_empty(),
+                "opening the preview must not call the attachment send boundary"
+            );
+            assert_eq!(app.keyboard_owner, Some(KeyboardOwner::PastePreview));
+            assert!(
+                app.paste_preview
+                    .as_ref()
+                    .is_some_and(|preview| preview.chat_was_visible),
+                "the preview must remember that its destination was visible before the modal"
+            );
+            assert!(
+                app.visible_chat.is_none(),
+                "a conversation covered by the modal must not count as visible"
+            );
+        });
+        cx.update(|window, cx| {
+            assert!(app.read(cx).paste_preview_focus.is_focused(window));
+        });
+        assert!(
+            cx.debug_bounds("paste-preview").is_some(),
+            "the pasted image must open a rendered preview"
+        );
+        assert!(
+            cx.debug_bounds("paste-preview-image").is_some(),
+            "the pasted image itself must be rendered in the preview"
+        );
+    }
+
+    #[gpui::test]
+    fn send_button_confirms_once_and_closes_preview(cx: &mut gpui::TestAppContext) {
+        let (mut cx, app) = paste_preview_fixture(cx);
+        let send = cx
+            .debug_bounds("paste-preview-send")
+            .expect("preview must render a Send control");
+        cx.simulate_click(send.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.read(|cx| {
+            let app = app.read(cx);
+            assert_eq!(app.attachment_attempts.len(), 1);
+            assert_eq!(app.attachment_attempts[0].file_name, "pasted.png");
+            assert_eq!(app.attachment_attempts[0].mime_type, "image/png");
+            assert_eq!(app.attachment_attempts[0].bytes, one_pixel_png());
+            assert!(app.paste_preview.is_none());
+        });
+        cx.simulate_click(send.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.read(|cx| assert_eq!(app.read(cx).attachment_attempts.len(), 1));
+    }
+
+    #[gpui::test]
+    fn cancel_button_discards_preview_without_sending(cx: &mut gpui::TestAppContext) {
+        let (mut cx, app) = paste_preview_fixture(cx);
+        let cancel = cx
+            .debug_bounds("paste-preview-cancel")
+            .expect("preview must render a Cancel control");
+        cx.simulate_click(cancel.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.read(|cx| {
+            assert!(app.read(cx).attachment_attempts.is_empty());
+            assert!(app.read(cx).paste_preview.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn escape_cancels_preview_without_sending_and_restores_composer(cx: &mut gpui::TestAppContext) {
+        let (mut cx, app) = paste_preview_fixture(cx);
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        cx.read(|cx| {
+            let app = app.read(cx);
+            assert!(app.paste_preview.is_none());
+            assert!(app.attachment_attempts.is_empty());
+            assert_eq!(app.keyboard_owner, Some(KeyboardOwner::Composer));
+        });
+        cx.update(|window, cx| {
+            let app = app.read(cx);
+            let composer = app.input_area.as_ref().unwrap().read(cx).focus_handle(cx);
+            assert!(composer.is_focused(window));
+        });
+    }
+
     #[test]
     fn body_invalidates_for_controllers_theme_resize_and_focus() {
         let (mut cx, window, app) = setup();

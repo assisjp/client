@@ -22,16 +22,18 @@ pub enum ChatFilter {
     All,
     Unread,
     Groups,
+    Archived,
 }
 
 impl ChatFilter {
-    pub const ALL: [Self; 3] = [Self::All, Self::Unread, Self::Groups];
+    pub const ALL: [Self; 4] = [Self::All, Self::Unread, Self::Groups, Self::Archived];
 
     pub fn id(self) -> &'static str {
         match self {
             Self::All => "all",
             Self::Unread => "unread",
             Self::Groups => "groups",
+            Self::Archived => "archived",
         }
     }
 
@@ -40,15 +42,17 @@ impl ChatFilter {
             Self::All => "All",
             Self::Unread => "Unread",
             Self::Groups => "Groups",
+            Self::Archived => "Archived",
         }
     }
 
     /// Whether `chat` belongs under this filter.
     pub fn matches(self, chat: &Chat) -> bool {
         match self {
-            Self::All => true,
-            Self::Unread => chat.unread_count > 0 || chat.manually_unread,
-            Self::Groups => chat.is_group,
+            Self::All => !chat.archived,
+            Self::Unread => !chat.archived && (chat.unread_count > 0 || chat.manually_unread),
+            Self::Groups => !chat.archived && chat.is_group,
+            Self::Archived => chat.archived,
         }
     }
 }
@@ -56,10 +60,11 @@ impl ChatFilter {
 /// What a complete store load says about a chat already on screen.
 ///
 /// A complete load is the store's whole truth about the rows it has, so a
-/// store-backed chat missing from one was archived or deleted — possibly on
-/// another device — and has to leave the window too. Two things stop that
-/// being a plain removal, and naming them here is what keeps the rule in one
-/// place: a live-only chat was never in the store to be missing from it (during
+/// active store-backed chat missing from one was archived or deleted —
+/// possibly on another device — and has to leave the main window too. An
+/// explicitly archived chat is outside that load's scope and stays available
+/// to the Archived filter. Two more things stop absence being a plain removal:
+/// a live-only chat was never in the store to be missing from it (during
 /// pairing the store is empty while live messages already populate the UI),
 /// and the conversation being *read* is not yanked out from under its reader.
 ///
@@ -85,7 +90,29 @@ pub fn survives_complete_load(
     loaded: &std::collections::HashSet<&str>,
     visible: Option<&str>,
 ) -> Survival {
-    if !chat.is_from_store() || loaded.contains(chat.jid.as_str()) {
+    // The ordinary complete load is complete only for the non-archived
+    // list. Once an archived page has installed a row, absence from that
+    // active load says nothing about it and must not erase the explicit list.
+    if chat.archived || !chat.is_from_store() || loaded.contains(chat.jid.as_str()) {
+        Survival::Keep
+    } else if visible == Some(chat.jid.as_str()) {
+        Survival::Defer
+    } else {
+        Survival::Drop
+    }
+}
+
+/// What a complete include-archived scan says about rows already held.
+///
+/// Unlike the active attach load, reaching the final page covers archived
+/// rows too. An archived, store-backed row absent from `loaded` was deleted;
+/// an active or live-only row is outside this scan's authority.
+pub fn survives_archived_scan(
+    chat: &Chat,
+    loaded: &std::collections::HashSet<String>,
+    visible: Option<&str>,
+) -> Survival {
+    if !chat.archived || !chat.is_from_store() || loaded.contains(&chat.jid) {
         Survival::Keep
     } else if visible == Some(chat.jid.as_str()) {
         Survival::Defer
@@ -176,13 +203,17 @@ impl WhatsAppApp {
                     // same reason: a reload while the reader is in Status
                     // would otherwise clear the badge of a conversation nobody
                     // was looking at.
-                    if self.window_focused && self.visible_chat.as_deref() == Some(jid.as_str()) {
+                    if self.window_focused
+                        && crate::platform::application_is_active()
+                        && self.visible_chat.as_deref() == Some(jid.as_str())
+                    {
                         Arc::make_mut(&mut self.chats[at]).mark_as_read();
                     }
                     // The read a row without messages could not bound. Spent
                     // here because this is what gave it a message to name; see
                     // `owed_reads`.
                     if self.window_focused
+                        && crate::platform::application_is_active()
                         && self.visible_chat.as_deref() == Some(jid.as_str())
                         && self.owed_reads.contains(&jid)
                         && let Some(newest) = newest_shared_message(&self.chats[at])
@@ -279,6 +310,20 @@ mod tests {
         assert!(!ChatFilter::Groups.matches(&chat("a@s.whatsapp.net", false, 9, false)));
     }
 
+    #[test]
+    fn archived_is_a_separate_list_for_direct_chats_and_groups() {
+        let mut direct = chat("a@s.whatsapp.net", false, 0, false);
+        direct.archived = true;
+        let mut group = chat("g@g.us", true, 0, false);
+        group.archived = true;
+
+        assert!(ChatFilter::Archived.matches(&direct));
+        assert!(ChatFilter::Archived.matches(&group));
+        assert!(!ChatFilter::All.matches(&direct));
+        assert!(!ChatFilter::Unread.matches(&direct));
+        assert!(!ChatFilter::Groups.matches(&group));
+    }
+
     fn from_store(jid: &str) -> Chat {
         Chat::from_store(jid.to_string(), "Someone".to_string(), 0)
     }
@@ -312,6 +357,40 @@ mod tests {
     }
 
     #[test]
+    fn an_archived_chat_survives_the_active_lists_complete_load() {
+        let mut archived = from_store("a@s.whatsapp.net");
+        archived.archived = true;
+        assert_eq!(
+            survives_complete_load(&archived, &std::collections::HashSet::new(), None),
+            Survival::Keep
+        );
+    }
+
+    #[test]
+    fn a_complete_archived_scan_drops_only_missing_archived_rows() {
+        let loaded = std::collections::HashSet::from(["kept@s.whatsapp.net".to_string()]);
+        let mut kept = from_store("kept@s.whatsapp.net");
+        kept.archived = true;
+        let mut deleted = from_store("deleted@s.whatsapp.net");
+        deleted.archived = true;
+        let active = from_store("active@s.whatsapp.net");
+
+        assert_eq!(survives_archived_scan(&kept, &loaded, None), Survival::Keep);
+        assert_eq!(
+            survives_archived_scan(&deleted, &loaded, None),
+            Survival::Drop
+        );
+        assert_eq!(
+            survives_archived_scan(&deleted, &loaded, Some("deleted@s.whatsapp.net")),
+            Survival::Defer
+        );
+        assert_eq!(
+            survives_archived_scan(&active, &loaded, None),
+            Survival::Keep
+        );
+    }
+
+    #[test]
     fn the_conversation_on_screen_is_spared_but_owed_a_removal() {
         let loaded = std::collections::HashSet::from(["b@s.whatsapp.net"]);
         assert_eq!(
@@ -338,7 +417,7 @@ mod tests {
     #[test]
     fn filter_ids_are_stable_and_distinct() {
         let ids: Vec<&str> = ChatFilter::ALL.iter().map(|f| f.id()).collect();
-        assert_eq!(ids, vec!["all", "unread", "groups"]);
+        assert_eq!(ids, vec!["all", "unread", "groups", "archived"]);
     }
 
     fn tied_chat(jid: &str, pin_secs: Option<i64>, secs: Option<i64>) -> Chat {

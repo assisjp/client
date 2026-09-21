@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use super::calls::CallRegistry;
 use super::history::{
     LoadedHistory, ReloadScope, apply_status_views, merge_alias_history_messages,
 };
@@ -14,8 +15,10 @@ use crate::StoreRegistry;
 use oxidezap_chat_store::{ChatEntry, StoreChange};
 use oxidezap_core::{Chat, ChatMessage, MessageStatus, fallback_chat_name};
 use std::sync::Arc;
+use whatsapp_rust::PresencePolicy;
 use whatsapp_rust::buffa::MessageField;
 use whatsapp_rust::wacore::proto_helpers::MessageBuilderExt;
+use whatsapp_rust::wacore::types::events::{Event, ServerAck};
 use whatsapp_rust::wacore_binary::Jid;
 use whatsapp_rust::waproto::whatsapp as wa;
 
@@ -28,6 +31,184 @@ fn book() -> NameBook {
 /// A name book that can reach the address book, the way the live paths do.
 fn book_with(store: &Arc<ChatStore>) -> NameBook {
     NameBook::new(Some(store.clone()))
+}
+
+#[tokio::test]
+async fn persistent_companion_uses_manual_presence() {
+    let store = SqliteStore::new("file:oxidezap-presence-policy?mode=memory&cache=shared")
+        .await
+        .expect("in-memory store");
+    let bot = super::persistent_companion(whatsapp_rust::bot::Bot::builder())
+        .with_backend(store)
+        .build()
+        .await
+        .expect("offline bot");
+
+    assert_eq!(bot.client().presence_policy(), PresencePolicy::Manual);
+}
+
+/// A previously available session must explicitly retract that state on
+/// reconnect; `Manual` alone prevents future automatic announcements but does
+/// not retract presence already known to the server.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn connected_companion_announces_unavailable() {
+    let fixture = whatsapp_rust::test_support::CallFixture::new()
+        .await
+        .expect("synthetic connected session");
+    let before = fixture.outgoing_stanzas().expect("outbound stanzas").len();
+
+    super::announce_background_presence(fixture.client())
+        .await
+        .expect("unavailable presence");
+
+    let sent = fixture.outgoing_stanzas().expect("outbound stanzas");
+    assert!(
+        sent[before..].iter().any(|node| {
+            let stanza = node.as_node_ref();
+            stanza.tag == "presence"
+                && stanza.attrs().optional_string("type").as_deref() == Some("unavailable")
+        }),
+        "reconnect must retract an older available state"
+    );
+    fixture.shutdown().await.expect("fixture shutdown");
+}
+
+#[test]
+fn the_live_data_lane_subscribes_to_server_acks() {
+    assert!(
+        super::DATA_EVENT_KINDS
+            .contains(&whatsapp_rust::wacore::types::events::EventKind::ServerAck)
+    );
+}
+
+#[test]
+fn a_server_ack_uses_its_chats_recoverable_lane() {
+    let ack = Event::ServerAck(
+        ServerAck::builder()
+            .id("ACKED-LANE".to_string())
+            .class("message".to_string())
+            .from(TEST_PEER.parse().expect("test JID"))
+            .build(),
+    );
+
+    assert!(super::lanes::recoverable(&ack));
+    assert_eq!(
+        super::lanes::event_subject(&ack)
+            .map(|subject| subject.as_written())
+            .as_deref(),
+        Some(TEST_PEER)
+    );
+}
+
+/// A positive message ack is the first delivery state after the optimistic
+/// clock. It must travel live rather than wait for the history reloader's
+/// quiet window, which a continuous history sync may never reach.
+#[tokio::test]
+async fn a_server_ack_publishes_a_live_sent_receipt() {
+    let (chat_store, client) = test_session("live-server-ack").await;
+    let (ui_tx, mut ui_rx) = super::ui_queue::channel(
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(super::ui_queue::HistoryBudget::new()),
+    );
+    let ack = Event::ServerAck(
+        ServerAck::builder()
+            .id("ACKED-1".to_string())
+            .class("message".to_string())
+            .from(TEST_PEER.parse().expect("test JID"))
+            .build(),
+    );
+
+    WhatsAppClient::handle_event(
+        Arc::new(ack),
+        client,
+        ui_tx,
+        CallRegistry::default(),
+        Arc::new(book_with(&chat_store)),
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        ui_rx.try_recv(),
+        Ok(oxidezap_core::UiEvent::ReceiptReceived {
+            chat_jid: TEST_PEER.to_string(),
+            message_ids: vec!["ACKED-1".to_string()],
+            receipt_type: oxidezap_core::ReceiptType::Sent,
+        })
+    );
+}
+
+/// A stanza ack is not necessarily a successful outgoing message. Publishing
+/// either of these as `Sent` would replace an honest clock/failure with a lie.
+#[tokio::test]
+async fn a_nack_or_non_message_ack_does_not_publish_sent() {
+    for (class, error) in [("message", Some("500")), ("receipt", None)] {
+        let (chat_store, client) = test_session(&format!("ignored-ack-{class}-{error:?}")).await;
+        let (ui_tx, mut ui_rx) = super::ui_queue::channel(
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(super::ui_queue::HistoryBudget::new()),
+        );
+        let ack = Event::ServerAck(
+            ServerAck::builder()
+                .id("NOT-SENT".to_string())
+                .class(class.to_string())
+                .from(TEST_PEER.parse().expect("test JID"))
+                .maybe_error(error.map(str::to_string))
+                .build(),
+        );
+
+        WhatsAppClient::handle_event(
+            Arc::new(ack),
+            client,
+            ui_tx,
+            CallRegistry::default(),
+            Arc::new(book_with(&chat_store)),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            ui_rx.try_recv().is_err(),
+            "{class} {error:?} published Sent"
+        );
+    }
+}
+
+/// The store can resolve a chatless ack by looking for a unique outgoing row;
+/// the live path cannot guess that ownership and leaves this rare shape to the
+/// durable recovery path.
+#[tokio::test]
+async fn a_chatless_ack_does_not_guess_a_live_destination() {
+    let (chat_store, client) = test_session("chatless-ack").await;
+    let (ui_tx, mut ui_rx) = super::ui_queue::channel(
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(super::ui_queue::HistoryBudget::new()),
+    );
+    let ack = Event::ServerAck(
+        ServerAck::builder()
+            .id("CHATLESS-1".to_string())
+            .class("message".to_string())
+            .build(),
+    );
+
+    WhatsAppClient::handle_event(
+        Arc::new(ack),
+        client,
+        ui_tx,
+        CallRegistry::default(),
+        Arc::new(book_with(&chat_store)),
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(ui_rx.try_recv().is_err());
 }
 
 /// A store-hydrated chat list must label a photo the way the live path
@@ -463,6 +644,261 @@ async fn a_live_self_mention_uses_the_sender_push_name() {
     }
 }
 
+/// The live wire event carries the durable alert decision, not the GUI's
+/// possibly-unhydrated chat row. The first committed message is eligible.
+#[tokio::test]
+async fn live_message_carries_store_notification_decision() {
+    let (chat_store, client) = test_session("notification-policy").await;
+    let info = live_info(
+        TEST_GROUP,
+        TEST_PEER,
+        Some("Example"),
+        "MSG-N1",
+        1_700_000_100,
+    );
+    feed(
+        &chat_store,
+        incoming_in(
+            TEST_GROUP,
+            wa::Message::text("first"),
+            "MSG-N1",
+            1_700_000_100,
+        ),
+    )
+    .await;
+    chat_store
+        .set_chat_name(&TEST_GROUP.parse().expect("test JID"), "Example group")
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    let (ui_tx, mut ui_rx) = super::ui_queue::channel(
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(super::ui_queue::HistoryBudget::new()),
+    );
+    WhatsAppClient::handle_inbound_message(
+        &wa::Message::text("first"),
+        &info,
+        &client,
+        &ui_tx,
+        &book_with(&chat_store),
+        true,
+    )
+    .await;
+    assert!(matches!(
+        ui_rx.try_recv(),
+        Ok(oxidezap_core::UiEvent::MessageReceived {
+            notification_allowed: true,
+            notification_title: Some(title),
+            ..
+        }) if title == "Example group"
+    ));
+
+    feed(
+        &chat_store,
+        Event::MuteUpdate(
+            whatsapp_rust::wacore::types::events::MuteUpdate::builder()
+                .jid(TEST_GROUP.parse().expect("test JID"))
+                .timestamp(whatsapp_rust::wacore::time::from_secs(1_700_000_200).unwrap())
+                .action(Box::new(wa::sync_action_value::MuteAction {
+                    muted: Some(true),
+                    ..Default::default()
+                }))
+                .from_full_sync(false)
+                .build(),
+        ),
+    )
+    .await;
+    WhatsAppClient::handle_inbound_message(
+        &wa::Message::text("second"),
+        &live_info(
+            TEST_GROUP,
+            TEST_PEER,
+            Some("Example"),
+            "MSG-N2",
+            1_700_000_201,
+        ),
+        &client,
+        &ui_tx,
+        &book_with(&chat_store),
+        true,
+    )
+    .await;
+    assert!(matches!(
+        ui_rx.try_recv(),
+        Ok(oxidezap_core::UiEvent::MessageReceived {
+            notification_allowed: false,
+            ..
+        })
+    ));
+
+    // A reconnect's offline drain updates the conversation but is not a
+    // newly arrived alert, even after the phone unmutes the group.
+    feed(
+        &chat_store,
+        Event::MuteUpdate(
+            whatsapp_rust::wacore::types::events::MuteUpdate::builder()
+                .jid(TEST_GROUP.parse().expect("test JID"))
+                .timestamp(whatsapp_rust::wacore::time::from_secs(1_700_000_300).unwrap())
+                .action(Box::new(wa::sync_action_value::MuteAction {
+                    muted: Some(false),
+                    ..Default::default()
+                }))
+                .from_full_sync(false)
+                .build(),
+        ),
+    )
+    .await;
+    WhatsAppClient::handle_inbound_message(
+        &wa::Message::text("older"),
+        &live_info(
+            TEST_GROUP,
+            TEST_PEER,
+            Some("Example"),
+            "MSG-N3",
+            1_700_000_050,
+        ),
+        &client,
+        &ui_tx,
+        &book_with(&chat_store),
+        false,
+    )
+    .await;
+    assert!(matches!(
+        ui_rx.try_recv(),
+        Ok(oxidezap_core::UiEvent::MessageReceived {
+            notification_allowed: false,
+            ..
+        })
+    ));
+}
+
+/// WhatsApp's explicit personal @mention is the exception to a group's mute
+/// and archive state. A bare @ in text is not, and an offline drain is never
+/// a fresh desktop alert even when it contains a mention.
+#[tokio::test]
+async fn direct_group_mention_alerts_through_mute_and_archive() {
+    use whatsapp_rust::waproto::buffa;
+    use whatsapp_rust::waproto::whatsapp::message;
+
+    const OWN: &str = "559900000001@s.whatsapp.net";
+    let (chat_store, client) = test_session("mention-notification-policy").await;
+    client
+        .persistence_manager()
+        .modify_device(|device| device.pn = Some(OWN.parse().expect("test JID")))
+        .await;
+    feed(
+        &chat_store,
+        incoming_in(
+            TEST_GROUP,
+            wa::Message::text("first"),
+            "MSG-M1",
+            1_700_000_100,
+        ),
+    )
+    .await;
+    chat_store
+        .set_chat_name(&TEST_GROUP.parse().expect("test JID"), "Example group")
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    feed(
+        &chat_store,
+        Event::MuteUpdate(
+            whatsapp_rust::wacore::types::events::MuteUpdate::builder()
+                .jid(TEST_GROUP.parse().expect("test JID"))
+                .timestamp(whatsapp_rust::wacore::time::from_secs(1_700_000_200).unwrap())
+                .action(Box::new(wa::sync_action_value::MuteAction {
+                    muted: Some(true),
+                    ..Default::default()
+                }))
+                .from_full_sync(false)
+                .build(),
+        ),
+    )
+    .await;
+    feed(
+        &chat_store,
+        Event::ArchiveUpdate(
+            whatsapp_rust::wacore::types::events::ArchiveUpdate::builder()
+                .jid(TEST_GROUP.parse().expect("test JID"))
+                .timestamp(whatsapp_rust::wacore::time::from_secs(1_700_000_200).unwrap())
+                .action(Box::new(wa::sync_action_value::ArchiveChatAction {
+                    archived: Some(true),
+                    ..Default::default()
+                }))
+                .from_full_sync(false)
+                .build(),
+        ),
+    )
+    .await;
+
+    let mention = wa::Message {
+        extended_text_message: buffa::MessageField::some(message::ExtendedTextMessage {
+            text: Some("oi @559900000001".to_string()),
+            context_info: buffa::MessageField::some(wa::ContextInfo {
+                mentioned_jid: vec![OWN.to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let (ui_tx, mut ui_rx) = super::ui_queue::channel(
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(super::ui_queue::HistoryBudget::new()),
+    );
+    WhatsAppClient::handle_inbound_message(
+        &mention,
+        &live_info(
+            TEST_GROUP,
+            TEST_PEER,
+            Some("Example"),
+            "MSG-M2",
+            1_700_000_201,
+        ),
+        &client,
+        &ui_tx,
+        &book_with(&chat_store),
+        true,
+    )
+    .await;
+    assert!(matches!(
+        ui_rx.try_recv(),
+        Ok(oxidezap_core::UiEvent::MessageReceived {
+            notification_allowed: true,
+            notification_title: Some(title),
+            notification_archived: true,
+            ..
+        }) if title == "Mentioned in Example group"
+    ));
+
+    for (message, eager) in [
+        (wa::Message::text("oi @559900000001"), true),
+        (mention.clone(), false),
+    ] {
+        WhatsAppClient::handle_inbound_message(
+            &message,
+            &live_info(
+                TEST_GROUP,
+                TEST_PEER,
+                Some("Example"),
+                "MSG-M3",
+                1_700_000_202,
+            ),
+            &client,
+            &ui_tx,
+            &book_with(&chat_store),
+            eager,
+        )
+        .await;
+        assert!(matches!(
+            ui_rx.try_recv(),
+            Ok(oxidezap_core::UiEvent::MessageReceived {
+                notification_allowed: false,
+                ..
+            })
+        ));
+    }
+}
+
 /// One inbound message's envelope, spelled out: the same fields [`from`]
 /// builds, without the event around them, for driving the live path directly.
 fn live_info(
@@ -863,7 +1299,7 @@ async fn test_session(name: &str) -> (Arc<ChatStore>, Arc<Client>) {
     .await
     .expect("in-memory store");
     let chat_store = ChatStore::new(&store).await.expect("chat store");
-    let bot = whatsapp_rust::bot::Bot::builder()
+    let bot = super::persistent_companion(whatsapp_rust::bot::Bot::builder())
         .with_backend(store)
         .with_inbound_durability_hook(super::ChatStoreDurabilityHook::new(chat_store.clone()))
         .build()
@@ -1031,7 +1467,7 @@ fn history_fallbacks_do_not_expose_internal_lids() {
 
     assert_eq!(fallback_chat_name(&lid), "Unknown contact");
     assert_eq!(fallback_chat_name(&pn), "+12025550143");
-    assert_eq!(fallback_chat_name(&group), "Unnamed group");
+    assert_eq!(fallback_chat_name(&group), "Group name unavailable");
 }
 
 #[test]
@@ -1368,6 +1804,20 @@ async fn a_scoped_load_skips_an_archived_chat() {
         loaded.chats.iter().all(|chat| chat.jid != peer),
         "a scoped pin answer leaves an archived chat out"
     );
+
+    let archived_entries = chat_store
+        .chats(true, 10)
+        .await
+        .expect("include-archived page loads");
+    let archived =
+        WhatsAppClient::hydrate_entries(&chat_store, &client, &book(), archived_entries, |_| 8)
+            .await
+            .expect("archived rows hydrate");
+    let restored = archived
+        .iter()
+        .find(|chat| chat.jid == peer)
+        .expect("archived chat is discoverable in its explicit list");
+    assert!(restored.archived, "archive state survives hydration");
 }
 
 /// A cursor is this crate's to write and to read, and the only thing that

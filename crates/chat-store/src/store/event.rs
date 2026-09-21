@@ -183,14 +183,20 @@ pub(super) fn apply_event(
             };
             let chat = crate::lid::route_chat_key(conn, device_id, &update.jid.to_string(), cs)?;
             ensure_chat(conn, device_id, &chat)?;
-            let stored: Option<i64> = chat_row(device_id, &chat)
-                .select(schema::chats::muted_until)
+            let (stored, seen): (Option<i64>, bool) = chat_row(device_id, &chat)
+                .select((
+                    schema::chats::muted_until,
+                    schema::chats::mute_appstate_seen,
+                ))
                 .first(conn)?;
-            if stored == muted_until {
+            if stored == muted_until && seen {
                 return Ok(());
             }
             diesel::update(chat_row(device_id, &chat))
-                .set(schema::chats::muted_until.eq(muted_until))
+                .set((
+                    schema::chats::muted_until.eq(muted_until),
+                    schema::chats::mute_appstate_seen.eq(true),
+                ))
                 .execute(conn)?;
             cs.chats = true;
             Ok(())
@@ -199,14 +205,20 @@ pub(super) fn apply_event(
             let chat = crate::lid::route_chat_key(conn, device_id, &update.jid.to_string(), cs)?;
             ensure_chat(conn, device_id, &chat)?;
             let archived = update.action.archived.unwrap_or(false);
-            let stored: bool = chat_row(device_id, &chat)
-                .select(schema::chats::archived)
+            let (stored, seen): (bool, bool) = chat_row(device_id, &chat)
+                .select((
+                    schema::chats::archived,
+                    schema::chats::archive_appstate_seen,
+                ))
                 .first(conn)?;
-            if stored == archived {
+            if stored == archived && seen {
                 return Ok(());
             }
             diesel::update(chat_row(device_id, &chat))
-                .set(schema::chats::archived.eq(archived))
+                .set((
+                    schema::chats::archived.eq(archived),
+                    schema::chats::archive_appstate_seen.eq(true),
+                ))
                 .execute(conn)?;
             cs.chats = true;
             Ok(())

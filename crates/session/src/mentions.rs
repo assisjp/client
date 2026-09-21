@@ -139,6 +139,20 @@ pub(crate) fn mentioned_jids(message: Option<&wa::Message>) -> Vec<String> {
     jids
 }
 
+/// Whether the wire's explicit mention list names this account under either
+/// its phone-number or LID address. A literal `@` in the text is not enough:
+/// it may be prose, a price, or a mention of somebody else.
+pub(crate) fn mentions_own_account(message: Option<&wa::Message>, own_jids: &[String]) -> bool {
+    if own_jids.is_empty() {
+        return false;
+    }
+    mentioned_jids(message).iter().any(|raw| {
+        raw.parse::<Jid>()
+            .ok()
+            .is_some_and(|jid| own_jids.iter().any(|own| *own == jid.to_non_ad_string()))
+    })
+}
+
 /// Rewrite the `@`-mentions in `text` to the names the book has for them.
 ///
 /// `message` is the proto the text was read off, or `None` where no proto
@@ -329,6 +343,40 @@ mod tests {
             mentioned_jids(Some(&message)),
             vec!["559900000002@s.whatsapp.net".to_string()]
         );
+    }
+
+    #[test]
+    fn only_an_explicit_own_pn_or_lid_mention_counts() {
+        let own = vec![
+            "559900000001@s.whatsapp.net".to_string(),
+            "123456789@lid".to_string(),
+        ];
+        assert!(mentions_own_account(
+            Some(&text_message(
+                "oi @559900000001",
+                &["559900000001@s.whatsapp.net"]
+            )),
+            &own
+        ));
+        assert!(mentions_own_account(
+            Some(&text_message("oi @123456789", &["123456789@lid"])),
+            &own
+        ));
+        assert!(!mentions_own_account(
+            Some(&text_message("oi @559900000001", &[])),
+            &own
+        ));
+        assert!(!mentions_own_account(
+            Some(&text_message(
+                "oi @559900000002",
+                &["559900000002@s.whatsapp.net"]
+            )),
+            &own
+        ));
+        assert!(!mentions_own_account(
+            Some(&text_message("oi @123456789", &["not-a-jid"])),
+            &own
+        ));
     }
 
     #[test]

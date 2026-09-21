@@ -107,6 +107,8 @@ pub(super) struct Pages {
     timelines: TimelinePages,
     /// Where the chat list continues.
     chats: Paging,
+    /// The include-archived list has a different ordering window and cursor.
+    archived_chats: Paging,
 }
 
 impl Pages {
@@ -114,6 +116,15 @@ impl Pages {
         Self {
             timelines: TimelinePages::new(),
             chats: Paging::default(),
+            archived_chats: Paging::default(),
+        }
+    }
+
+    fn chat_list(&mut self, archived: bool) -> &mut Paging {
+        if archived {
+            &mut self.archived_chats
+        } else {
+            &mut self.chats
         }
     }
 
@@ -148,9 +159,10 @@ impl Pages {
 
     /// The cursor the next page of the chat list is asked with, marking it
     /// asked. The inner `None` is "from the top".
-    fn more_chats(&mut self) -> Option<Option<PageCursor>> {
-        let ask = self.chats.to_ask()?;
-        self.chats = Paging::Loading { from: ask.clone() };
+    fn more_chats(&mut self, archived: bool) -> Option<Option<PageCursor>> {
+        let list = self.chat_list(archived);
+        let ask = list.to_ask()?;
+        *list = Paging::Loading { from: ask.clone() };
         Some(ask)
     }
 
@@ -172,23 +184,27 @@ impl Pages {
     }
 
     /// The same, for the chat list.
-    fn chat_page_arrived(&mut self, next: Option<PageCursor>) -> bool {
-        let Paging::Loading { from } = &self.chats else {
+    fn chat_page_arrived(&mut self, archived: bool, next: Option<PageCursor>) -> bool {
+        let list = self.chat_list(archived);
+        let Paging::Loading { from } = list else {
             return false;
         };
-        self.chats = Paging::arrived(from.clone(), next);
+        *list = Paging::arrived(from.clone(), next);
         true
     }
 
     /// A page that was refused. Put the position back so it can be asked for
     /// again; a list that stayed `Loading` would never ask anything again.
-    fn lost(&mut self, jid: Option<&str>) {
+    fn lost(&mut self, jid: Option<&str>, archived: bool) {
         match jid {
             Some(jid) => {
                 let paging = self.timelines.entry(jid.to_string()).or_default();
                 *paging = paging.lost();
             }
-            None => self.chats = self.chats.lost(),
+            None => {
+                let list = self.chat_list(archived);
+                *list = list.lost();
+            }
         }
     }
 
@@ -209,12 +225,23 @@ impl Pages {
             }
         }
         self.chats = self.chats.reopened();
+        // Unlike the active list, no attach load refreshes the archived
+        // list's first page. An archive change can insert a recent chat
+        // before every cursor this window already crossed, so resuming from
+        // the old end would never discover it. Restart from the top once any
+        // in-flight answer has settled; a request already on the wire keeps
+        // its position so an older response cannot be mistaken for a newer
+        // one.
+        if !matches!(self.archived_chats, Paging::Loading { .. }) {
+            self.archived_chats = Paging::Unasked;
+        }
     }
 
     /// Everything this window learned about where its lists continue.
     fn forget(&mut self) {
         self.timelines.clear();
         self.chats = Paging::Unasked;
+        self.archived_chats = Paging::Unasked;
     }
 }
 
@@ -265,8 +292,12 @@ impl WhatsAppApp {
         let Some(client) = &self.client else {
             return;
         };
-        if let Some(ask) = self.pages.update(cx, |pages, _| pages.more_chats()) {
-            client.load_chats(ask);
+        let archived = self.chat_filter == super::ChatFilter::Archived;
+        if let Some(ask) = self.pages.update(cx, |pages, _| pages.more_chats(archived)) {
+            if archived && ask.is_none() {
+                self.archived_scan.clear();
+            }
+            client.load_chats(ask, archived);
         }
     }
 
@@ -324,19 +355,32 @@ impl WhatsAppApp {
         &mut self,
         chats: Vec<Chat>,
         next: Option<PageCursor>,
+        archived: bool,
         cx: &mut Context<Self>,
     ) {
+        let archived_scan_finished = archived && next.is_none();
         // The same rule, and the one that matters most: this page's rows go
         // into the list whether or not anything else remembers them.
         if !self
             .pages
-            .update(cx, |pages, _| pages.chat_page_arrived(next))
+            .update(cx, |pages, _| pages.chat_page_arrived(archived, next))
         {
             debug!("a chat page arrived that nobody asked for");
             return;
         }
         if chats.is_empty() {
+            if archived_scan_finished {
+                self.finish_archived_scan(cx);
+            }
             return;
+        }
+        if archived {
+            self.archived_scan.extend(
+                chats
+                    .iter()
+                    .filter(|chat| chat.archived)
+                    .map(|chat| chat.jid.clone()),
+            );
         }
         // The same entrance a history load uses: a page that merely called
         // `merge_chats` left a notice for a group that arrives only by page
@@ -344,13 +388,50 @@ impl WhatsAppApp {
         // that arrived the same way. Nothing here says a status update was
         // watched — only a load knows that.
         self.install_chats(chats, &std::collections::HashSet::new(), cx);
+        if archived_scan_finished {
+            self.finish_archived_scan(cx);
+        }
+        cx.notify();
+    }
+
+    /// Prune archived rows only after their include-archived scan reached its
+    /// final page. Before then, absence means merely "not loaded yet".
+    fn finish_archived_scan(&mut self, cx: &mut Context<Self>) {
+        let visible = self.visible_chat.clone();
+        let mut deferred = Vec::new();
+        let mut dropped = Vec::new();
+        {
+            let mut cache = self.message_list_cache.borrow_mut();
+            self.chats.retain(|chat| {
+                match super::survives_archived_scan(chat, &self.archived_scan, visible.as_deref()) {
+                    super::Survival::Keep => true,
+                    super::Survival::Defer => {
+                        deferred.push(chat.jid.clone());
+                        true
+                    }
+                    super::Survival::Drop => {
+                        cache.remove(&chat.jid);
+                        dropped.push(chat.jid.clone());
+                        false
+                    }
+                }
+            });
+        }
+        self.departed_chats.extend(deferred);
+        if dropped.is_empty() {
+            return;
+        }
+        self.forget_chat_paging(&dropped, cx);
+        self.forget_missing_selection();
+        self.invalidate_chat_cache();
         cx.notify();
     }
 
     /// A page that was refused. Put the position back so it can be asked for
     /// again; a view that stayed `Loading` would never ask anything again.
-    pub(super) fn page_lost(&mut self, jid: Option<String>, cx: &mut App) {
-        self.pages.update(cx, |pages, _| pages.lost(jid.as_deref()));
+    pub(super) fn page_lost(&mut self, jid: Option<String>, archived: bool, cx: &mut App) {
+        self.pages
+            .update(cx, |pages, _| pages.lost(jid.as_deref(), archived));
     }
 
     /// Forget where these conversations continued.
@@ -519,6 +600,19 @@ mod tests {
         ] {
             assert!(!matches!(settled, Paging::Loading { .. }));
         }
+    }
+
+    #[test]
+    fn active_and_archived_chat_lists_keep_independent_cursors() {
+        let mut pages = Pages::new();
+
+        assert_eq!(pages.more_chats(false), Some(None));
+        assert_eq!(pages.more_chats(true), Some(None));
+        assert!(pages.chat_page_arrived(false, Some(cursor("active-next"))));
+        assert!(pages.chat_page_arrived(true, Some(cursor("archive-next"))));
+
+        assert_eq!(pages.more_chats(false), Some(Some(cursor("active-next"))));
+        assert_eq!(pages.more_chats(true), Some(Some(cursor("archive-next"))));
     }
 
     /// A load walks the store's order itself, so what it says about the end
@@ -762,12 +856,12 @@ mod tests {
     fn a_page_from_a_forgotten_account_is_refused() {
         let mut pages = Pages::new();
         pages.open_timeline(CHAT);
-        assert!(pages.more_chats().is_some());
+        assert!(pages.more_chats(false).is_some());
 
         pages.forget();
 
         assert!(!pages.timeline_page_arrived(CHAT, None));
-        assert!(!pages.chat_page_arrived(None));
+        assert!(!pages.chat_page_arrived(false, None));
     }
 
     /// A refusal puts both lists back where they were asking from, so the
@@ -778,13 +872,17 @@ mod tests {
         pages.open_timeline(CHAT);
         pages.timeline_page_arrived(CHAT, Some(cursor("m1:9:2")));
         pages.older(CHAT);
-        pages.more_chats();
+        pages.more_chats(false);
 
-        pages.lost(Some(CHAT));
-        pages.lost(None);
+        pages.lost(Some(CHAT), false);
+        pages.lost(None, false);
 
         assert_eq!(pages.older(CHAT), Some(cursor("m1:9:2")));
-        assert_eq!(pages.more_chats(), Some(None), "from the top, as before");
+        assert_eq!(
+            pages.more_chats(false),
+            Some(None),
+            "from the top, as before"
+        );
     }
 
     /// A chat that left takes its position with it: a JID is reused, and a
@@ -814,7 +912,7 @@ mod tests {
         pages.timeline_page_arrived(CHAT, Some(cursor("m1:9:2")));
         pages.older(CHAT);
         pages.timeline_page_arrived(CHAT, None);
-        pages.more_chats();
+        pages.more_chats(false);
 
         pages.reopen(&[CHAT.to_string()]);
 
@@ -824,9 +922,26 @@ mod tests {
             "asking again from where it stopped"
         );
         assert_eq!(
-            pages.more_chats(),
+            pages.more_chats(false),
             None,
             "and a chat list still waiting is left alone"
+        );
+    }
+
+    #[test]
+    fn an_archived_list_restarts_at_the_top_after_store_changes() {
+        let mut pages = Pages::new();
+        pages.more_chats(true);
+        pages.chat_page_arrived(true, Some(cursor("archive-next")));
+        pages.more_chats(true);
+        pages.chat_page_arrived(true, None);
+
+        pages.reopen(&[]);
+
+        assert_eq!(
+            pages.more_chats(true),
+            Some(None),
+            "a newly archived recent chat can sort before the old cursor"
         );
     }
 }

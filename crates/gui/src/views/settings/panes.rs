@@ -405,8 +405,9 @@ fn notifications(metrics: Metrics, cx: &App) -> AnyElement {
     group(
         label("NOTIFICATIONS", metrics, cx),
         pending(
-            "This client does not raise desktop notifications yet. The daemon \
-             carries a tray presence; routing messages through it is the next step.",
+            "Incoming messages raise desktop notifications while this window is running, \
+             except for the conversation currently visible in the active window. Clicking a \
+             notification opens that conversation.",
             metrics,
             cx,
         ),

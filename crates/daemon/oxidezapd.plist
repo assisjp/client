@@ -6,6 +6,11 @@
 	<string>com.oxidezap.daemon</string>
 	<key>CFBundleName</key>
 	<string>oxidezapd</string>
+	<!-- The daemon owns the menu-bar item and WhatsApp session, but it is not
+	     a second user-facing application. Keep AppKit available for NSStatusItem
+	     without registering another Dock icon. -->
+	<key>LSUIElement</key>
+	<true/>
 	<key>NSCameraUsageDescription</key>
 	<string>oxidezap needs the camera so you can be seen on a video call.</string>
 	<key>NSMicrophoneUsageDescription</key>

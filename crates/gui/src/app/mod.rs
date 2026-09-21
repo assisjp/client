@@ -942,11 +942,11 @@ pub struct WhatsAppApp {
 struct IncomingAlert {
     allowed: bool,
     title: Option<String>,
-    archived: bool,
+    archived: Option<bool>,
 }
 
 impl IncomingAlert {
-    fn new(allowed: bool, title: Option<String>, archived: bool) -> Self {
+    fn new(allowed: bool, title: Option<String>, archived: Option<bool>) -> Self {
         Self {
             allowed,
             title,
@@ -3058,8 +3058,8 @@ impl WhatsAppApp {
         if let Some(index) = chat_index {
             // Update the existing chat
             let chat = Arc::make_mut(&mut self.chats[index]);
-            if alert.archived {
-                chat.archived = true;
+            if let Some(archived) = alert.archived {
+                chat.archived = archived;
             }
 
             // For groups: update participant name, NOT the chat name
@@ -3105,7 +3105,7 @@ impl WhatsAppApp {
             } else {
                 Chat::new(chat_jid.clone())
             };
-            new_chat.archived = alert.archived;
+            new_chat.archived = alert.archived.unwrap_or(false);
 
             // For groups: track participant
             if is_group && let Some(ref name) = sender_name {
@@ -3953,7 +3953,7 @@ mod tests {
                             "New message".into(),
                         ),
                         Some("Example contact".into()),
-                        IncomingAlert::new(true, None, false),
+                        IncomingAlert::new(true, None, Some(false)),
                         cx,
                     );
                 });
@@ -3970,7 +3970,7 @@ mod tests {
                         "Quiet message".into(),
                     ),
                     Some("Muted contact".into()),
-                    IncomingAlert::new(false, None, false),
+                    IncomingAlert::new(false, None, None),
                     cx,
                 );
             });
@@ -3988,7 +3988,7 @@ mod tests {
                         "No longer quiet".into(),
                     ),
                     Some("Muted contact".into()),
-                    IncomingAlert::new(true, None, false),
+                    IncomingAlert::new(true, None, Some(false)),
                     cx,
                 );
             });
@@ -4016,7 +4016,7 @@ mod tests {
                             "Group message".into(),
                         ),
                         Some(sender.into()),
-                        IncomingAlert::new(true, None, false),
+                        IncomingAlert::new(true, None, Some(false)),
                         cx,
                     );
                 });
@@ -4041,7 +4041,7 @@ mod tests {
                         "Muted before hydration".into(),
                     ),
                     Some("Member".into()),
-                    IncomingAlert::new(false, Some("Stored subject".into()), false),
+                    IncomingAlert::new(false, Some("Stored subject".into()), None),
                     cx,
                 );
                 app.handle_message_received(
@@ -4052,7 +4052,7 @@ mod tests {
                         "Allowed before hydration".into(),
                     ),
                     Some("Member".into()),
-                    IncomingAlert::new(true, Some("Stored subject".into()), false),
+                    IncomingAlert::new(true, Some("Stored subject".into()), Some(false)),
                     cx,
                 );
             });
@@ -4071,7 +4071,11 @@ mod tests {
                         "Mentioned you".into(),
                     ),
                     Some("Member".into()),
-                    IncomingAlert::new(true, Some("Mentioned in Archived example".into()), true),
+                    IncomingAlert::new(
+                        true,
+                        Some("Mentioned in Archived example".into()),
+                        Some(true),
+                    ),
                     cx,
                 );
                 assert!(
@@ -4085,6 +4089,49 @@ mod tests {
             cx.shown_system_notifications()[5].title.as_ref(),
             "Mentioned in Archived example"
         );
+
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                // The phone explicitly unarchived this conversation. The
+                // live store answer must remove it from Archived immediately,
+                // without waiting for a later paged history reload.
+                app.handle_message_received(
+                    "archived-group@g.us".into(),
+                    ChatMessage::new_incoming(
+                        "MESSAGE-UNARCHIVED".into(),
+                        "member@example.invalid".into(),
+                        "No longer archived".into(),
+                    ),
+                    Some("Member".into()),
+                    IncomingAlert::new(false, None, Some(false)),
+                    cx,
+                );
+                assert!(
+                    app.find_chat("archived-group@g.us")
+                        .is_some_and(|chat| !chat.archived)
+                );
+
+                // A frame without durable metadata is not an instruction to
+                // unarchive an already-known row (older daemon compatibility).
+                app.find_chat_mut("archived-group@g.us").unwrap().archived = true;
+                app.handle_message_received(
+                    "archived-group@g.us".into(),
+                    ChatMessage::new_incoming(
+                        "MESSAGE-UNKNOWN-ARCHIVE".into(),
+                        "member@example.invalid".into(),
+                        "Unknown archive state".into(),
+                    ),
+                    Some("Member".into()),
+                    IncomingAlert::new(false, None, None),
+                    cx,
+                );
+                assert!(
+                    app.find_chat("archived-group@g.us")
+                        .is_some_and(|chat| chat.archived)
+                );
+            });
+        });
+        assert_eq!(cx.shown_system_notifications().len(), 6);
     }
 
     fn at(secs: i64) -> Option<chrono::DateTime<chrono::Utc>> {

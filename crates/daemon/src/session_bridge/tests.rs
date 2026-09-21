@@ -30,7 +30,7 @@ pub(super) fn received(chat_jid: &str, message: ChatMessage, sender_name: Option
         sender_name: sender_name.map(str::to_string),
         notification_allowed: false,
         notification_title: None,
-        notification_archived: false,
+        notification_archived: None,
     }
 }
 

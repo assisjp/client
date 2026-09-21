@@ -722,7 +722,7 @@ mod tests {
                 sender_name: None,
                 notification_allowed: false,
                 notification_title: None,
-                notification_archived: false,
+                notification_archived: None,
             })
             .unwrap();
         sender
@@ -736,7 +736,7 @@ mod tests {
                 sender_name: None,
                 notification_allowed: false,
                 notification_title: None,
-                notification_archived: false,
+                notification_archived: None,
             })
             .unwrap();
         assert_eq!(sender.stats().dropped_recoverable, 1);

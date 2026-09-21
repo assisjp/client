@@ -865,7 +865,7 @@ async fn direct_group_mention_alerts_through_mute_and_archive() {
         Ok(oxidezap_core::UiEvent::MessageReceived {
             notification_allowed: true,
             notification_title: Some(title),
-            notification_archived: true,
+            notification_archived: Some(true),
             ..
         }) if title == "Mentioned in Example group"
     ));

@@ -2177,19 +2177,19 @@ impl WhatsAppClient {
                         } else {
                             None
                         };
-                        (allowed, title, metadata.archived)
+                        (allowed, title, Some(metadata.archived))
                     }
-                    Ok(None) => (false, None, false),
+                    Ok(None) => (false, None, None),
                     Err(error) => {
                         warn!("could not read chat notification policy: {error}");
-                        (false, None, false)
+                        (false, None, None)
                     }
                 }
             } else {
-                (false, None, false)
+                (false, None, None)
             }
         } else {
-            (false, None, false)
+            (false, None, None)
         };
 
         let _ = ui_tx.send(UiEvent::MessageReceived {

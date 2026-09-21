@@ -69,10 +69,11 @@ pub enum UiEvent {
         /// or a generated group placeholder.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         notification_title: Option<String>,
-        /// The store says this conversation is archived. A live @mention may
-        /// still alert, but the GUI must not resurrect it in the active list.
-        #[serde(default)]
-        notification_archived: bool,
+        /// The store's archive answer. `None` means not known (including an
+        /// older daemon frame), distinct from an explicit unarchive. A live
+        /// @mention may still alert without resurrecting an archived chat.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notification_archived: Option<bool>,
     },
     ReceiptReceived {
         chat_jid: String,
@@ -404,7 +405,7 @@ mod notification_wire_tests {
             sender_name: None,
             notification_allowed: true,
             notification_title: Some("Example group".into()),
-            notification_archived: true,
+            notification_archived: Some(true),
         };
         let mut wire = serde_json::to_value(event).unwrap();
         let fields = wire
@@ -420,7 +421,7 @@ mod notification_wire_tests {
             UiEvent::MessageReceived {
                 notification_allowed: false,
                 notification_title: None,
-                notification_archived: false,
+                notification_archived: None,
                 ..
             }
         ));

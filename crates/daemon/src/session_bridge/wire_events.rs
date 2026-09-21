@@ -297,7 +297,7 @@ mod tests {
                 sender_name: None,
                 notification_allowed: false,
                 notification_title: None,
-                notification_archived: false,
+                notification_archived: None,
             }),
         })
         .unwrap();

@@ -12,7 +12,7 @@ use gpui_component::{ActiveTheme as _, Disableable as _, FocusTrapElement as _};
 
 use crate::app::WhatsAppApp;
 use crate::components::parts;
-use crate::platform::picker::{Picked, kind_for};
+use crate::platform::picker::Picked;
 use crate::theme::Metrics;
 use crate::utils::{format_size, mime_to_image_format};
 
@@ -24,7 +24,7 @@ pub fn preview_images(files: &[Picked]) -> Vec<Option<Arc<Image>>> {
     files
         .iter()
         .map(|file| {
-            (kind_for(&file.mime_type) == oxidezap_core::OutgoingMedia::Image)
+            (file.kind == oxidezap_core::OutgoingMedia::Image)
                 .then(|| mime_to_image_format(&file.mime_type))
                 .flatten()
                 .map(|format| Arc::new(Image::from_bytes(format, file.bytes.clone())))
@@ -125,11 +125,7 @@ pub fn render_paste_preview(
 }
 
 fn render_file_card(file: &Picked, metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
-    let kind = match kind_for(&file.mime_type) {
-        oxidezap_core::OutgoingMedia::Image => "Image",
-        oxidezap_core::OutgoingMedia::Video => "Video",
-        oxidezap_core::OutgoingMedia::Document => "Document",
-    };
+    let kind = media_label(file.kind);
     let name: SharedString = file.file_name.clone().into();
     let mime: SharedString = file.mime_type.clone().into();
     let size = format_size(file.bytes.len() as u64);
@@ -210,6 +206,7 @@ fn render_file_meta(file: &Picked, metrics: Metrics, cx: &App) -> impl IntoEleme
         .text_size(metrics.text_small())
         .text_color(cx.theme().foreground)
         .overflow_hidden()
+        .child(media_label(file.kind))
         .child(name)
         .child(
             div()
@@ -221,15 +218,24 @@ fn render_file_meta(file: &Picked, metrics: Metrics, cx: &App) -> impl IntoEleme
         )
 }
 
+fn media_label(kind: oxidezap_core::OutgoingMedia) -> &'static str {
+    match kind {
+        oxidezap_core::OutgoingMedia::Image => "Imagem",
+        oxidezap_core::OutgoingMedia::Video => "Vídeo",
+        oxidezap_core::OutgoingMedia::Document => "Documento",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::preview_images;
     use crate::platform::picker::Picked;
 
-    fn picked(file_name: &str, mime_type: &str) -> Picked {
+    fn picked(file_name: &str, mime_type: &str, kind: oxidezap_core::OutgoingMedia) -> Picked {
         Picked {
             file_name: file_name.to_owned(),
             mime_type: mime_type.to_owned(),
+            kind,
             bytes: vec![1, 2, 3],
         }
     }
@@ -237,9 +243,17 @@ mod tests {
     #[test]
     fn preview_payloads_keep_picker_order_and_media_identity() {
         let files = vec![
-            picked("photo.png", "image/png"),
-            picked("clip.mp4", "video/mp4"),
-            picked("notes.pdf", "application/pdf"),
+            picked(
+                "photo.png",
+                "image/png",
+                oxidezap_core::OutgoingMedia::Image,
+            ),
+            picked("clip.mp4", "video/mp4", oxidezap_core::OutgoingMedia::Video),
+            picked(
+                "notes.pdf",
+                "application/pdf",
+                oxidezap_core::OutgoingMedia::Document,
+            ),
         ];
 
         let images = preview_images(&files);
@@ -254,5 +268,19 @@ mod tests {
         assert_eq!(files[0].file_name, "photo.png");
         assert_eq!(files[1].file_name, "clip.mp4");
         assert_eq!(files[2].file_name, "notes.pdf");
+    }
+
+    #[test]
+    fn document_kind_wins_over_an_image_mime() {
+        let files = [picked(
+            "photo.jpg",
+            "image/jpeg",
+            oxidezap_core::OutgoingMedia::Document,
+        )];
+
+        assert!(
+            preview_images(&files)[0].is_none(),
+            "a document attachment must not render a photo thumbnail"
+        );
     }
 }

@@ -21,11 +21,7 @@ fn image_from_item(item: gpui::ClipboardItem) -> Result<Option<Picked>, String> 
     {
         return Err(reason);
     }
-    Ok(Some(Picked {
-        file_name,
-        mime_type,
-        bytes: image.bytes,
-    }))
+    Ok(Some(Picked::automatic(file_name, mime_type, image.bytes)))
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -77,6 +73,7 @@ mod tests {
             .expect("image");
         assert_eq!(picked.file_name, "pasted.png");
         assert_eq!(picked.mime_type, "image/png");
+        assert_eq!(picked.kind, oxidezap_core::OutgoingMedia::Image);
         assert_eq!(picked.bytes, vec![1, 2, 3]);
     }
 }

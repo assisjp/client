@@ -64,14 +64,18 @@ impl WhatsAppApp {
         Some((jid, self.reply_to.clone()))
     }
 
-    /// Ask for files and send them into the open conversation.
+    /// Ask for files under the category selected from the attachment button.
     ///
     /// The choosing is asynchronous on both platforms — a modal on one, a
     /// promise on the other — so everything after it happens in a
     /// continuation, and the conversation it was started from travels with it
     /// rather than being read again at the end: somebody who picks a file and
     /// then opens another chat meant to send it to the first.
-    pub(super) fn attach_files(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn attach_category(
+        &mut self,
+        category: crate::platform::picker::AttachmentCategory,
+        cx: &mut Context<Self>,
+    ) {
         if self.paste_preview.is_some() {
             return;
         }
@@ -92,7 +96,7 @@ impl WhatsAppApp {
         // chose anything in is a reply the person still thinks they are
         // composing. It is cleared where it is used.
         let reply = self.reply_to.clone();
-        let chosen = crate::platform::picker::choose(cx);
+        let chosen = crate::platform::picker::choose_category(cx, category);
         cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let chosen = chosen.await;
             let _ = entity.update(cx, |app, cx| app.finish_attaching(&jid, reply, chosen, cx));
@@ -254,10 +258,9 @@ impl WhatsAppApp {
             return false;
         };
 
-        // The picker's answer rather than the protocol's: `for_mime` says what
-        // an `image/*` is, and the picker says which of those actually reach
-        // the recipient as a picture. See `picker::kind_for`.
-        let kind = crate::platform::picker::kind_for(&file.mime_type);
+        // The category selected before choosing is authoritative. The MIME
+        // still describes the bytes, but cannot override "Documento" here.
+        let kind = file.kind;
         let local_id = Self::next_local_id("local_media");
         // Built before the bytes are handed over, because for a picture it
         // *is* those bytes: the sender sees what they sent rather than a
@@ -360,11 +363,7 @@ mod tests {
     /// being asserted is what the *type* decides, and no branch here reads a
     /// byte of a document.
     fn picked(file_name: &str, mime_type: &str) -> Picked {
-        Picked {
-            file_name: file_name.to_string(),
-            mime_type: mime_type.to_string(),
-            bytes: vec![0; 4096],
-        }
+        Picked::automatic(file_name.to_string(), mime_type.to_string(), vec![0; 4096])
     }
 
     /// A picture in a format the far end will not draw goes as a document, so
@@ -414,6 +413,50 @@ mod tests {
             assert_eq!(echo.media_type, MediaType::Image, "{photo}");
             assert_eq!(echo.data.len(), file.bytes.len(), "{photo}");
         }
+    }
+
+    #[gpui::test]
+    fn explicit_document_kind_survives_confirmation_for_media(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let app = cx.update(|cx| cx.new(WhatsAppApp::new));
+        let mut photo = picked("photo.jpg", "image/jpeg");
+        photo.kind = OutgoingMedia::Document;
+        let mut video = picked("clip.mp4", "video/mp4");
+        video.kind = OutgoingMedia::Document;
+
+        app.update(cx, |app, cx| {
+            app.finish_attaching(
+                "peer@example.invalid",
+                None,
+                Ok(crate::platform::picker::Chosen {
+                    files: vec![photo.clone(), video.clone()],
+                    refused: Vec::new(),
+                }),
+                cx,
+            );
+            assert!(app.attachment_attempts.is_empty());
+            let pending = app.paste_preview.as_ref().expect("confirmation pending");
+            assert!(
+                pending
+                    .files
+                    .iter()
+                    .all(|file| file.kind == OutgoingMedia::Document)
+            );
+            app.confirm_paste_preview(cx);
+            app.confirm_paste_preview(cx);
+            assert_eq!(app.attachment_attempts.len(), 2);
+            assert!(
+                app.attachment_attempts
+                    .iter()
+                    .all(|file| file.kind == OutgoingMedia::Document)
+            );
+            assert_eq!(app.attachment_attempts[0].mime_type, "image/jpeg");
+            assert_eq!(app.attachment_attempts[1].mime_type, "video/mp4");
+            assert_eq!(echo_of(&photo, photo.kind).media_type, MediaType::Document);
+        });
     }
 
     #[gpui::test]

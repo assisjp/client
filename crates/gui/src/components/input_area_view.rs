@@ -12,9 +12,11 @@ use gpui_component::{
     ActiveTheme, Disableable as _, Icon, IconName, Sizable as _,
     button::{Button, ButtonVariants},
     input::{InputEvent, Paste, Textarea, TextareaState},
+    menu::{DropdownMenu as _, PopupMenuItem},
 };
 
 use crate::components::{ProductIcon, parts};
+use crate::platform::picker::AttachmentCategory;
 use crate::theme::{ActiveProductTheme as _, Metrics};
 
 /// Events emitted by the input area to communicate with the parent app.
@@ -22,12 +24,11 @@ use crate::theme::{ActiveProductTheme as _, Metrics};
 pub enum InputAreaEvent {
     /// User wants to send the current message
     SendMessage(String),
-    /// User wants to attach files to this conversation.
+    /// User picked an attachment category from the composer menu.
     ///
-    /// Carries nothing: which conversation is the app's to know, and the
-    /// files are chosen after the press — a dialog the composer neither owns
-    /// nor waits for.
-    AttachFiles,
+    /// Which conversation is the app's to know, and the files are chosen
+    /// after the press — a dialog the composer neither owns nor waits for.
+    AttachFiles(AttachmentCategory),
     /// An image pasted into this conversation.
     PasteImage(u64, Rc<RefCell<Option<crate::platform::picker::Picked>>>),
     /// An image paste was rejected before it could be sent.
@@ -473,8 +474,32 @@ impl InputAreaView {
                     "Attach a photo, a video or a document",
                     control,
                 )
-                .on_click(move |_, _window, cx| {
-                    attach_entity.update(cx, |_view, cx| cx.emit(InputAreaEvent::AttachFiles));
+                .debug_selector(|| "attach-trigger".into())
+                .dropdown_menu(move |menu, _window, _cx| {
+                    let photos_entity = attach_entity.clone();
+                    let document_entity = attach_entity.clone();
+                    menu.item(
+                        PopupMenuItem::new("Documento")
+                            .icon(Icon::from(ProductIcon::FileText))
+                            .on_click(move |_, _window, cx| {
+                                document_entity.update(cx, |_view, cx| {
+                                    cx.emit(InputAreaEvent::AttachFiles(
+                                        AttachmentCategory::Document,
+                                    ));
+                                });
+                            }),
+                    )
+                    .item(
+                        PopupMenuItem::new("Fotos e vídeos")
+                            .icon(Icon::from(ProductIcon::Image))
+                            .on_click(move |_, _window, cx| {
+                                photos_entity.update(cx, |_view, cx| {
+                                    cx.emit(InputAreaEvent::AttachFiles(
+                                        AttachmentCategory::PhotosVideos,
+                                    ));
+                                });
+                            }),
+                    )
                 }),
             )
             .child(
@@ -690,6 +715,7 @@ mod tests {
     };
 
     use super::{InputAreaEvent, InputAreaView};
+    use crate::platform::picker::AttachmentCategory;
 
     struct ComposerHarness {
         input: Entity<InputAreaView>,
@@ -780,6 +806,43 @@ mod tests {
         cx.run_until_parked();
     }
 
+    struct VisualComposerFixture {
+        cx: gpui::VisualTestContext,
+        attachment_categories: Rc<RefCell<Vec<AttachmentCategory>>>,
+        _events: Subscription,
+    }
+
+    fn visual_setup(cx: &mut gpui::TestAppContext) -> VisualComposerFixture {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let mut input_entity = None;
+        let window = cx.open_window(size(px(640.), px(120.)), |window, cx| {
+            let input = cx.new(|cx| InputAreaView::new(window, cx));
+            input_entity = Some(input.clone());
+            ComposerHarness { input }
+        });
+        let input = input_entity.expect("composer input should be created");
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        let attachment_categories = Rc::new(RefCell::new(Vec::new()));
+        let observed = attachment_categories.clone();
+        let events = cx.update(|_window, cx| {
+            cx.subscribe(&input, move |_, event: &InputAreaEvent, _| {
+                if let InputAreaEvent::AttachFiles(category) = event {
+                    observed.borrow_mut().push(*category);
+                }
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        VisualComposerFixture {
+            cx,
+            attachment_categories,
+            _events: events,
+        }
+    }
+
     #[test]
     fn focused_composer_pastes_a_clipboard_image() {
         let ComposerFixture {
@@ -820,5 +883,50 @@ mod tests {
 
         cx.update(|cx| assert_eq!(input.read(cx).input.read(cx).text(), "hello"));
         assert!(pasted_images.borrow().is_empty());
+    }
+
+    #[gpui::test]
+    fn attachment_menu_stays_silent_until_a_category_is_confirmed(
+        test_cx: &mut gpui::TestAppContext,
+    ) {
+        let VisualComposerFixture {
+            mut cx,
+            attachment_categories,
+            _events,
+            ..
+        } = visual_setup(test_cx);
+
+        let attach = cx
+            .debug_bounds("attach-trigger")
+            .expect("attachment button should be rendered");
+        cx.simulate_click(attach.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            attachment_categories.borrow().is_empty(),
+            "opening the category menu must not emit an attachment event"
+        );
+
+        // The menu is keyboard-focused on open. Its first item is Document,
+        // matching the user-facing menu order and preserving keyboard access.
+        cx.simulate_keystrokes("down enter");
+        cx.run_until_parked();
+
+        assert_eq!(
+            attachment_categories.borrow().as_slice(),
+            [AttachmentCategory::Document]
+        );
+
+        cx.simulate_click(attach.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.simulate_keystrokes("down down enter");
+        cx.run_until_parked();
+        assert_eq!(
+            attachment_categories.borrow().as_slice(),
+            [
+                AttachmentCategory::Document,
+                AttachmentCategory::PhotosVideos
+            ]
+        );
     }
 }

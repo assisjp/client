@@ -2746,8 +2746,8 @@ impl WhatsAppApp {
             InputAreaEvent::SendMessage(text) => {
                 self.send_message(text, cx);
             }
-            InputAreaEvent::AttachFiles => {
-                self.attach_files(cx);
+            InputAreaEvent::AttachFiles(category) => {
+                self.attach_category(*category, cx);
             }
             InputAreaEvent::PasteImage(paste_id, file) => {
                 let Some(file) = file.borrow_mut().take() else {

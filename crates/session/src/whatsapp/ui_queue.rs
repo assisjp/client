@@ -484,11 +484,17 @@ fn estimated_bytes(event: &UiEvent) -> usize {
             chat_jid,
             message,
             sender_name,
+            notification_title,
+            ..
         } => {
             std::mem::size_of_val(event)
                 + string_bytes(chat_jid)
                 + message_bytes(message)
                 + sender_name.as_deref().map(string_bytes).unwrap_or_default()
+                + notification_title
+                    .as_deref()
+                    .map(string_bytes)
+                    .unwrap_or_default()
         }
         _ => std::mem::size_of_val(event) + event_strings(event),
     }
@@ -714,6 +720,9 @@ mod tests {
                     "body".into(),
                 )),
                 sender_name: None,
+                notification_allowed: false,
+                notification_title: None,
+                notification_archived: None,
             })
             .unwrap();
         sender
@@ -725,6 +734,9 @@ mod tests {
                     "body".into(),
                 )),
                 sender_name: None,
+                notification_allowed: false,
+                notification_title: None,
+                notification_archived: None,
             })
             .unwrap();
         assert_eq!(sender.stats().dropped_recoverable, 1);

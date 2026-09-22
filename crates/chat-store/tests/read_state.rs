@@ -971,6 +971,186 @@ async fn wire_indefinite_mute_value_reads_as_forever() {
     assert_eq!(chats[0].muted_until, Some(chrono::DateTime::<Utc>::MAX_UTC));
 }
 
+/// Alert policy must use durable conversation metadata, including rows the
+/// GUI has never paged in. A new committed chat is allowed; no row is not.
+#[tokio::test]
+async fn notification_policy_is_fail_closed_and_follows_mute_and_archive() {
+    let (_store, chat_store) = test_store().await;
+    assert!(
+        chat_store
+            .notification_metadata(&jid(GROUP))
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("first"),
+            incoming_info(GROUP, PEER, "MSG-ALERT", 1_700_000_000),
+        )],
+    )
+    .await;
+    chat_store
+        .set_chat_name(&jid(GROUP), "Example group")
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    let metadata = chat_store
+        .notification_metadata(&jid(GROUP))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(metadata.allowed);
+    assert_eq!(metadata.name.as_deref(), Some("Example group"));
+
+    feed(
+        &chat_store,
+        [Event::MuteUpdate(
+            wacore::types::events::MuteUpdate::builder()
+                .jid(jid(GROUP))
+                .timestamp(ts(1_700_000_100))
+                .action(Box::new(wa::sync_action_value::MuteAction {
+                    muted: Some(true),
+                    mute_end_timestamp: Some(-1),
+                    ..Default::default()
+                }))
+                .from_full_sync(false)
+                .build(),
+        )],
+    )
+    .await;
+    assert!(
+        !chat_store
+            .notification_metadata(&jid(GROUP))
+            .await
+            .unwrap()
+            .unwrap()
+            .allowed
+    );
+
+    feed(
+        &chat_store,
+        [Event::MuteUpdate(
+            wacore::types::events::MuteUpdate::builder()
+                .jid(jid(GROUP))
+                .timestamp(ts(1_700_000_200))
+                .action(Box::new(wa::sync_action_value::MuteAction {
+                    muted: Some(false),
+                    ..Default::default()
+                }))
+                .from_full_sync(false)
+                .build(),
+        )],
+    )
+    .await;
+    assert!(
+        chat_store
+            .notification_metadata(&jid(GROUP))
+            .await
+            .unwrap()
+            .unwrap()
+            .allowed
+    );
+
+    // An expired mute is stored metadata but no longer suppresses an alert.
+    feed(
+        &chat_store,
+        [Event::MuteUpdate(
+            wacore::types::events::MuteUpdate::builder()
+                .jid(jid(GROUP))
+                .timestamp(ts(1_700_000_250))
+                .action(Box::new(wa::sync_action_value::MuteAction {
+                    muted: Some(true),
+                    mute_end_timestamp: Some(1_700_000_200_000),
+                    ..Default::default()
+                }))
+                .from_full_sync(false)
+                .build(),
+        )],
+    )
+    .await;
+    let metadata = chat_store
+        .notification_metadata(&jid(GROUP))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!metadata.muted);
+    assert!(metadata.allowed);
+
+    feed(
+        &chat_store,
+        [Event::ArchiveUpdate(
+            wacore::types::events::ArchiveUpdate::builder()
+                .jid(jid(GROUP))
+                .timestamp(ts(1_700_000_300))
+                .action(Box::new(wa::sync_action_value::ArchiveChatAction {
+                    archived: Some(true),
+                    ..Default::default()
+                }))
+                .from_full_sync(false)
+                .build(),
+        )],
+    )
+    .await;
+    assert!(
+        !chat_store
+            .notification_metadata(&jid(GROUP))
+            .await
+            .unwrap()
+            .unwrap()
+            .allowed
+    );
+}
+
+#[tokio::test]
+async fn notification_policy_checks_both_unmerged_peer_aliases() {
+    let (store, chat_store) = test_store().await;
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("phone side"),
+                incoming_info(PEER, PEER, "MSG-PN", 1_700_000_000),
+            ),
+            Event::MuteUpdate(
+                wacore::types::events::MuteUpdate::builder()
+                    .jid(jid(PEER))
+                    .timestamp(ts(1_700_000_050))
+                    .action(Box::new(wa::sync_action_value::MuteAction {
+                        muted: Some(true),
+                        ..Default::default()
+                    }))
+                    .from_full_sync(false)
+                    .build(),
+            ),
+            message_event(
+                wa::Message::text("newer LID side"),
+                incoming_info(PEER_LID, PEER_LID, "MSG-LID", 1_700_000_100),
+            ),
+        ],
+    )
+    .await;
+    add_lid_mapping(&store).await;
+
+    assert!(
+        !chat_store
+            .notification_metadata(&jid(PEER))
+            .await
+            .unwrap()
+            .unwrap()
+            .allowed
+    );
+    assert!(
+        !chat_store
+            .notification_metadata(&jid(PEER_LID))
+            .await
+            .unwrap()
+            .unwrap()
+            .allowed
+    );
+}
+
 #[tokio::test]
 async fn noop_mark_read_clears_manual_unread_marker() {
     let (_store, chat_store) = test_store().await;

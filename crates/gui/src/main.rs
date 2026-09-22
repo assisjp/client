@@ -59,6 +59,7 @@ fn open_the_window() {
         // Before anything asks for one: a page's text system starts empty and
         // resolving a font it has not been given is a panic, not a fallback.
         crate::platform::fonts(cx);
+        cx.set_app_identity("org.oxidezap.client.local", "OxideZap");
         gpui_component::init(cx);
         // Reads ~/.config/oxidezap/theme.json over a preset. Cannot fail: a
         // missing or malformed file resolves to the product default and
@@ -79,6 +80,30 @@ fn open_the_window() {
             },
             |window, cx| {
                 let view = cx.new(WhatsAppApp::new);
+                let notification_view = view.downgrade();
+                let notification_window = window.window_handle();
+                let app_notification_window = notification_window;
+                cx.on_system_notification_response(move |response, cx| {
+                    let tag = response.tag.to_string();
+                    cx.dismiss_system_notification(&tag);
+                    cx.activate(true);
+                    if notification_window
+                        .update(cx, |_, window, cx| {
+                            window.activate_window();
+                            let _ = notification_view.update(cx, |app, cx| {
+                                app.open_system_notification(&tag, window, cx);
+                            });
+                        })
+                        .is_err()
+                    {
+                        log::debug!("notification activated after its window closed");
+                    }
+                });
+                // Registering the callback initializes GPUI's notification
+                // center and installs its response delegate. Ask only after
+                // that delegate exists, and before the session can deliver an
+                // incoming message.
+                crate::platform::request_notification_authorization();
                 // The theme file is watched for the window's whole life,
                 // not for the part of it that is pairing. Armed from the
                 // pairing screen alone, a window that opened onto an
@@ -87,6 +112,7 @@ fn open_the_window() {
                 // and edits to an existing `theme.json` did nothing until
                 // the next restart.
                 view.update(cx, |app, cx| {
+                    app.set_notification_window(app_notification_window);
                     app.watch_theme_file(cx);
                     // After the window exists, so the ten seconds a cold
                     // start can spend waiting for a daemon to come up are

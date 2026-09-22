@@ -327,6 +327,9 @@ impl WhatsAppApp {
             self.decline_waiting_call(cx);
             return;
         }
+        if self.cancel_paste_preview(cx) {
+            return;
+        }
         if self.close_media_viewer(cx) {
             return;
         }

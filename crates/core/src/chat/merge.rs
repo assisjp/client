@@ -103,6 +103,10 @@ impl Chat {
         if hydrated.pinned_at.is_some() || hydrated.from_store {
             self.pinned_at = hydrated.pinned_at;
         }
+        if hydrated.from_store {
+            self.muted_until = hydrated.muted_until;
+            self.archived = hydrated.archived;
+        }
         if hydrated.last_message_time >= self.last_message_time {
             // What an absent preview means depends on whether the load
             // brought messages. With messages, the store simply has no TEXT
@@ -353,6 +357,19 @@ mod tests {
         assert_eq!(chat.avatar_picture_id.as_deref(), Some("stored"));
         assert_eq!(chat.avatar_cache_key.as_deref(), Some("a-stored"));
         assert!(chat.avatar_loaded);
+    }
+
+    #[test]
+    fn store_hydration_is_authoritative_for_archive_state() {
+        let jid = "a@s.whatsapp.net".to_string();
+        let mut chat = Chat::new(jid.clone());
+        let mut archived = Chat::from_store(jid.clone(), "Someone".into(), 0);
+        archived.archived = true;
+        chat.merge_history(archived);
+        assert!(chat.archived);
+
+        chat.merge_history(Chat::from_store(jid, "Someone".into(), 0));
+        assert!(!chat.archived, "an unarchive from the store also wins");
     }
 
     #[test]

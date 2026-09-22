@@ -8,15 +8,15 @@ use std::str::FromStr;
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
 use log::warn;
-use wacore_binary::Jid;
+use wacore_binary::jid::{Jid, JidExt};
 
 use crate::error::{ChatStoreError, Result, db_err};
 use crate::schema;
 use crate::store::ChatStore;
 use crate::types::{
-    ArrivalCursor, AvatarDescriptor, ChatCursor, ChatEntry, ContactEntry, MediaRef,
-    MessageCoverage, MessageCursor, MessageKind, MessageStatus, ReactionEntry, ReceiptEntry,
-    StoredMessage,
+    ArrivalCursor, AvatarDescriptor, ChatCursor, ChatEntry, ChatNotificationMetadata, ContactEntry,
+    MediaRef, MessageCoverage, MessageCursor, MessageKind, MessageStatus, ReactionEntry,
+    ReceiptEntry, StoredMessage,
 };
 
 /// How many keys one batched lookup may bind at a time.
@@ -165,6 +165,10 @@ struct ChatRow {
     read_boundary_ms: i64,
     #[allow(dead_code)]
     read_boundary_ids: Option<String>,
+    #[allow(dead_code)]
+    mute_appstate_seen: bool,
+    #[allow(dead_code)]
+    archive_appstate_seen: bool,
 }
 
 impl From<ChatRow> for ChatEntry {
@@ -440,6 +444,58 @@ impl ChatStore {
             })
             .await?;
         Ok(row.map(Into::into))
+    }
+
+    /// Alert policy and title from the durable conversation rows.
+    ///
+    /// A live message may precede GUI hydration, so the front end's `Chat`
+    /// cannot answer whether the phone muted or archived the conversation.
+    /// Unlike `chat()`, this reads *both* sides of a split PN/LID pair: a
+    /// stale alias with an active mute must not be bypassed just because the
+    /// other side has the newer message. No row means unknown, not allowed.
+    pub async fn notification_metadata(
+        &self,
+        jid: &Jid,
+    ) -> Result<Option<ChatNotificationMetadata>> {
+        use schema::chats::dsl;
+        let device_id = self.device_id();
+        let is_group = jid.is_group();
+        let jid = jid.to_string();
+        let now_ms = wacore::time::now_utc().timestamp_millis();
+        let rows: Vec<(Option<i64>, bool, Option<String>)> = self
+            .db()
+            .read(move |conn| {
+                let keys =
+                    crate::lid::chat_key_candidates(conn, device_id, &jid).map_err(db_err)?;
+                dsl::chats
+                    .filter(dsl::device_id.eq(device_id).and(dsl::jid.eq_any(keys)))
+                    .order((dsl::last_message_ts.desc(), dsl::jid.desc()))
+                    .select((dsl::muted_until, dsl::archived, dsl::name))
+                    .load(conn)
+                    .map_err(db_err)
+            })
+            .await?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let muted = rows
+            .iter()
+            .any(|(mute, _, _)| mute.is_some_and(|until| until > now_ms));
+        let archived = rows.iter().any(|(_, archived, _)| *archived);
+        let name = rows
+            .into_iter()
+            .filter_map(|(_, _, name)| name)
+            .find(|name| {
+                !name.trim().is_empty()
+                    && !(is_group
+                        && matches!(name.trim(), "Unnamed group" | "Group name unavailable"))
+            });
+        Ok(Some(ChatNotificationMetadata {
+            muted,
+            archived,
+            allowed: !muted && !archived,
+            name,
+        }))
     }
 
     /// Every special chat's identity columns, in one read.

@@ -6411,6 +6411,8 @@ dependencies = [
  "js-sys",
  "ksni",
  "log",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
  "oxidezap-core",
  "oxidezap-ipc",
  "oxidezap-logging",
@@ -6439,6 +6441,7 @@ name = "oxidezap-gui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "block2 0.6.2",
  "chrono",
  "futures-channel",
  "futures-lite",
@@ -6453,6 +6456,10 @@ dependencies = [
  "js-sys",
  "log",
  "mp4",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
+ "objc2-user-notifications",
  "openh264",
  "oxidezap-audio",
  "oxidezap-core",

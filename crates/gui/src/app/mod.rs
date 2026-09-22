@@ -34,7 +34,9 @@ pub use calls::CallCard;
 #[cfg(all(test, unix))]
 pub(crate) use calls_ctl::exercise_call_frame_adoption;
 pub use chat_row::{ChatRow, Preview, PreviewGlyph, Unread};
-pub use chats::{ChatFilter, ChatListCache, Survival, survives_complete_load};
+pub use chats::{
+    ChatFilter, ChatListCache, Survival, survives_archived_scan, survives_complete_load,
+};
 pub use media::RecordingState;
 pub use messages::{BubbleIds, MessageListCache, TimelineItem};
 pub use paging::nearing_end;
@@ -123,6 +125,8 @@ enum KeyboardOwner {
     /// A call that is ringing — not one that has been answered, which is a
     /// call people type through.
     RingingCall(String),
+    /// An image pasted into the composer, waiting for explicit confirmation.
+    PastePreview,
     /// The fullscreen viewer, which owns the arrow keys while it is up.
     Viewer,
     /// A screen with its own controls — Settings. It is handed the window's
@@ -152,8 +156,20 @@ pub struct KeyboardSurfaces {
     /// `leave_connected_view` does not close it — while the error screen that
     /// replaces the conversation draws nothing of it.
     pub viewer: bool,
+    /// The modal preview for a pasted image.
+    pub paste_preview: bool,
     /// The call card, which only the connected screens float.
     pub call_card: bool,
+}
+
+struct PendingPastePreview {
+    jid: String,
+    reply: Option<ReplyDraft>,
+    file: crate::platform::picker::Picked,
+    image: Arc<gpui::Image>,
+    /// Whether the captured destination was the conversation on screen before
+    /// this modal deliberately hid it from read/paging accounting.
+    chat_was_visible: bool,
 }
 
 /// The layout a set of row heights was measured against.
@@ -270,14 +286,14 @@ pub use status::{Destination, StatusPane};
 pub use viewer::MediaViewer;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use indexmap::IndexMap;
 
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, Image, KeyBinding, ListState, ScrollStrategy,
-    Task, WeakEntity, Window, actions, div, prelude::*,
+    SystemNotification, Task, WeakEntity, Window, actions, div, prelude::*,
 };
 use gpui_component::VirtualListScrollHandle;
 use gpui_component::input::InputState;
@@ -349,6 +365,7 @@ pub struct RetryMessage {
 
 use crate::components::{
     AccountSummary, InputAreaEvent, InputAreaView, ReplyDraft, new_timeline_state,
+    render_paste_preview,
 };
 use log::{debug, error, info, warn};
 use wacore_binary::jid::{Jid, JidExt, observe_str};
@@ -638,6 +655,9 @@ pub struct WhatsAppApp {
     control: Option<Session>,
     /// Destination captured while an asynchronous clipboard read is pending.
     pending_pastes: HashMap<u64, (String, Option<ReplyDraft>)>,
+    paste_preview: Option<PendingPastePreview>,
+    #[cfg(test)]
+    attachment_attempts: Vec<crate::platform::picker::Picked>,
     /// Scroll handle for chat list
     chat_list_scroll: VirtualListScrollHandle,
     /// The Status sidebar's scroll position, so that list can have a
@@ -648,6 +668,8 @@ pub struct WhatsAppApp {
     /// Focus target for the call card, so its actions are reachable from
     /// the keyboard while it floats over the app.
     call_focus: FocusHandle,
+    /// Focus target for the pasted-image confirmation modal.
+    paste_preview_focus: FocusHandle,
     /// Focus target for the window itself, so the actions hung off the root
     /// are reachable whatever else is on screen — including on the screens on
     /// the way to a conversation, which have no list and no composer to
@@ -662,6 +684,29 @@ pub struct WhatsAppApp {
     keyboard_owner: Option<KeyboardOwner>,
     window_focused: bool,
     window_activation: Option<gpui::Subscription>,
+    /// Incoming messages this process has already surfaced to the operating
+    /// system. The session may redeliver an event while reconnecting, and a
+    /// notification is a user-visible side effect rather than an idempotent
+    /// timeline merge.
+    notified_messages: IndexMap<(String, String, String), ()>,
+    /// The window handle used to finish opening a notification after its chat
+    /// arrives. A notification response can beat the first chat snapshot (or
+    /// a later archived page), so resolving only against `chats` at click time
+    /// would silently lose the action.
+    notification_window: Option<gpui::AnyWindowHandle>,
+    /// Clicked notifications whose chats are not hydrated in this window yet.
+    /// Keep them in click order so a burst of responses is retried one by one;
+    /// the newest click is consequently the final selection when both arrive.
+    pending_notification_tags: VecDeque<String>,
+    /// The most recent click wins focus. Older queued tags are still retried,
+    /// but resolving one after a newer click must never navigate backward.
+    latest_notification_tag: Option<String>,
+    /// Backoff task for a chat-list page refusal. A refused page otherwise
+    /// leaves a pending click waiting forever, while retrying inline can spin
+    /// if the daemon keeps refusing it.
+    #[allow(dead_code)]
+    notification_retry_task: Option<Task<()>>,
+    notification_retry_backoff: std::time::Duration,
     /// Whether the last gesture that touched a conversation was someone
     /// meaning to *talk* to it or meaning to *look* at it.
     ///
@@ -717,6 +762,9 @@ pub struct WhatsAppApp {
     /// without remembering the omission, the chat outlived its deletion until
     /// some unrelated later reload happened to notice again.
     departed_chats: std::collections::HashSet<String>,
+    /// Archived store rows seen since the current include-archived scan
+    /// started at the top. When its final page arrives, absence is deletion.
+    archived_scan: std::collections::HashSet<String>,
     /// Chats opened before their messages arrived, whose reads are still owed.
     ///
     /// `MarkRead` is a claim about the message the requester was looking at,
@@ -907,6 +955,51 @@ pub struct WhatsAppApp {
     last_avatar_window_fingerprint: Option<u64>,
 }
 
+/// Store-backed attention decision delivered with a live message. The GUI's
+/// paged chat row may not yet know any of these facts.
+struct IncomingAlert {
+    allowed: bool,
+    title: Option<String>,
+    archived: Option<bool>,
+}
+
+const NOTIFICATION_PAGE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
+const MAX_NOTIFICATION_PAGE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn next_notification_retry_delay(current: std::time::Duration) -> std::time::Duration {
+    current
+        .checked_mul(2)
+        .unwrap_or(MAX_NOTIFICATION_PAGE_RETRY_DELAY)
+        .min(MAX_NOTIFICATION_PAGE_RETRY_DELAY)
+}
+
+/// Add a notification response once, retaining the newest occurrence at the
+/// back of the FIFO. A repeated click is a new ordering signal, not a second
+/// request for the same tag.
+fn enqueue_pending_notification(queue: &mut VecDeque<String>, tag: &str) {
+    if let Some(index) = queue.iter().position(|queued| queued == tag) {
+        queue.remove(index);
+    }
+    queue.push_back(tag.to_string());
+}
+
+fn remove_pending_notification(queue: &mut VecDeque<String>, tag: &str) -> bool {
+    let Some(index) = queue.iter().position(|queued| queued == tag) else {
+        return false;
+    };
+    queue.remove(index).is_some()
+}
+
+impl IncomingAlert {
+    fn new(allowed: bool, title: Option<String>, archived: Option<bool>) -> Self {
+        Self {
+            allowed,
+            title,
+            archived,
+        }
+    }
+}
+
 impl WhatsAppApp {
     pub fn media_cache(&self) -> Option<std::sync::Arc<dyn crate::session::MediaCache>> {
         self.client.as_ref().map(Session::media_cache)
@@ -1025,7 +1118,18 @@ impl WhatsAppApp {
                             &*event,
                             UiEvent::MessageReceived { .. } | UiEvent::HistoryLoaded { .. }
                         );
+                        let hydration = matches!(&*event, UiEvent::HistoryLoaded { .. });
                         app.handle_event(*event, cx);
+                        if hydration {
+                            app.reset_notification_retry_backoff();
+                        }
+                        // A notification click may have arrived before the
+                        // list/history event that owns its chat. Retrying
+                        // after every session event is cheap when there is no
+                        // pending tag, and makes HistoryLoaded a valid retry
+                        // point without coupling the paging module to window
+                        // handles.
+                        app.retry_pending_notification(cx);
                         if bearing {
                             app.sweep_retained_media(cx);
                         }
@@ -1086,8 +1190,14 @@ impl WhatsAppApp {
                     } => entity.update(cx, |app, cx| {
                         app.apply_message_page(jid, messages, next, cx);
                     }),
-                    FromDaemon::Chats { chats, next } => entity.update(cx, |app, cx| {
-                        app.apply_chat_page(chats, next, cx);
+                    FromDaemon::Chats {
+                        chats,
+                        next,
+                        archived,
+                    } => entity.update(cx, |app, cx| {
+                        app.apply_chat_page(chats, next, archived, cx);
+                        app.reset_notification_retry_backoff();
+                        app.retry_pending_notification(cx);
                     }),
                     // Who is in a group, for the line under its name.
                     FromDaemon::Members(roster) => entity.update(cx, |app, cx| {
@@ -1106,8 +1216,12 @@ impl WhatsAppApp {
                     FromDaemon::CallFrames => entity.update(cx, |app, cx| {
                         app.draw_waiting_call_frames(cx);
                     }),
-                    FromDaemon::PageLost { jid } => entity.update(cx, |app, cx| {
-                        app.page_lost(jid, cx);
+                    FromDaemon::PageLost { jid, archived } => entity.update(cx, |app, cx| {
+                        let chat_list_page = jid.is_none();
+                        app.page_lost(jid, archived, cx);
+                        if chat_list_page {
+                            app.retry_pending_notification_after_page_loss(cx);
+                        }
                     }),
                     FromDaemon::StatusViewLost(message_ids) => entity.update(cx, |app, cx| {
                         app.forget_status_views(&message_ids, cx);
@@ -1167,14 +1281,24 @@ impl WhatsAppApp {
             selected_chat: None,
             client: None,
             pending_pastes: HashMap::new(),
+            paste_preview: None,
+            #[cfg(test)]
+            attachment_attempts: Vec::new(),
             chat_list_scroll: VirtualListScrollHandle::new(),
             status_list_scroll: gpui::ScrollHandle::new(),
             chat_list_focus: cx.focus_handle(),
             call_focus: cx.focus_handle(),
+            paste_preview_focus: cx.focus_handle(),
             root_focus: cx.focus_handle(),
             keyboard_owner: None,
             window_focused: false,
             window_activation: None,
+            notified_messages: IndexMap::new(),
+            notification_window: None,
+            pending_notification_tags: VecDeque::new(),
+            latest_notification_tag: None,
+            notification_retry_task: None,
+            notification_retry_backoff: NOTIFICATION_PAGE_RETRY_DELAY,
             // Nothing has been opened to talk to yet, and a window that comes
             // up on a restored selection is one nobody has typed into.
             keyboard_intent: ChatOpen::ToPreview,
@@ -1184,6 +1308,7 @@ impl WhatsAppApp {
             visible_chat: None,
             retained_chat: None,
             departed_chats: std::collections::HashSet::new(),
+            archived_scan: std::collections::HashSet::new(),
             owed_reads: std::collections::HashSet::new(),
             pages: cx.new(|_| paging::Pages::new()),
             watched_status: std::collections::HashSet::new(),
@@ -1724,13 +1849,13 @@ impl WhatsAppApp {
         if self.window_activation.is_some() {
             return;
         }
-        self.window_focused = cx
-            .active_window()
-            .is_some_and(|active| active == window.window_handle());
+        // GPUI's `active_window` is the application's main window on macOS,
+        // which can remain this window while another application is in front.
+        // Only the key window is actually receiving input and may claim that
+        // its visible conversation was read.
+        self.window_focused = window.is_window_active();
         self.window_activation = Some(cx.observe_window_activation(window, |app, window, cx| {
-            let focused = cx
-                .active_window()
-                .is_some_and(|active| active == window.window_handle());
+            let focused = window.is_window_active();
             if app.window_focused == focused {
                 return;
             }
@@ -1743,12 +1868,23 @@ impl WhatsAppApp {
     }
 
     fn resume_visible_read(&mut self, cx: &mut Context<Self>) {
+        if !chat_read_can_be_committed(
+            self.window_focused,
+            crate::platform::application_is_active(),
+            self.client.is_some(),
+        ) {
+            return;
+        }
+        let Some(client) = self.client.as_ref() else {
+            return;
+        };
         let Some(jid) = self.visible_chat.clone() else {
             return;
         };
+        let owed = self.owed_reads.contains(&jid);
         let Some(chat) = self
             .find_chat(&jid)
-            .filter(|chat| chat.unread_count > 0 || chat.manually_unread)
+            .filter(|chat| chat_read_needs_resume(chat, owed))
         else {
             return;
         };
@@ -1756,9 +1892,8 @@ impl WhatsAppApp {
             self.owed_reads.insert(jid);
             return;
         };
-        if let Some(client) = &self.client {
-            client.mark_chat_read(&jid, newest);
-        }
+        client.mark_chat_read(&jid, newest);
+        self.owed_reads.remove(&jid);
         if let Some(chat) = self.find_chat_mut(&jid) {
             chat.mark_as_read();
         }
@@ -1799,6 +1934,12 @@ impl WhatsAppApp {
         // newly paired one.
         self.leave_connected_view(cx);
         self.pending_pastes.clear();
+        self.paste_preview = None;
+        self.notified_messages.clear();
+        self.pending_notification_tags.clear();
+        self.latest_notification_tag = None;
+        self.notification_retry_task = None;
+        self.notification_retry_backoff = NOTIFICATION_PAGE_RETRY_DELAY;
         // A call is account state as much as a chat is. See
         // [`calls_ctl::Calls::forget`].
         self.calls.update(cx, |calls, cx| calls.forget(cx));
@@ -1818,6 +1959,7 @@ impl WhatsAppApp {
         self.visible_chat = None;
         self.retained_chat = None;
         self.departed_chats.clear();
+        self.archived_scan.clear();
         // The cursors describe positions in one account's store; the next
         // account's rows are not behind them.
         self.forget_paging(cx);
@@ -1978,6 +2120,11 @@ impl WhatsAppApp {
     /// to go.
     pub fn can_send(&self) -> bool {
         self.is_connected()
+    }
+
+    /// Whether the conversation is covered by a pasted-image confirmation.
+    pub fn paste_preview_showing(&self) -> bool {
+        self.paste_preview.is_some()
     }
 
     /// Whether the user chose to stop waiting and read what is here.
@@ -2412,16 +2559,23 @@ impl WhatsAppApp {
         // action separately: the daemon owns both, along with the boundary
         // that keeps a read from swallowing anything newer. All it needs from
         // here is the message this side is looking at.
-        if self.window_focused
-            && let Some(chat) = self
-                .find_chat(&jid)
-                .filter(|c| c.unread_count > 0 || c.manually_unread)
+        let mut mark_locally = false;
+        let owed = self.owed_reads.contains(&jid);
+        if chat_read_can_be_committed(
+            self.window_focused,
+            crate::platform::application_is_active(),
+            self.client.is_some(),
+        ) && let Some(chat) = self
+            .find_chat(&jid)
+            .filter(|c| chat_read_needs_resume(c, owed))
         {
             match read_bound(chat) {
                 ReadBound::Now(newest) => {
                     info!("Marking {} read", observe_str(&jid));
-                    if let Some(client) = &self.client {
+                    if let Some(client) = self.client.as_ref() {
                         client.mark_chat_read(&jid, newest);
+                        self.owed_reads.remove(&jid);
+                        mark_locally = true;
                     }
                 }
                 ReadBound::WhenLoaded => {
@@ -2430,12 +2584,15 @@ impl WhatsAppApp {
                         observe_str(&jid)
                     );
                     self.owed_reads.insert(jid.clone());
+                    mark_locally = true;
                 }
             }
         }
 
-        // Mark as read locally
-        if let Some(chat) = self.find_chat_mut(&jid) {
+        // Mark as read locally only after a remote read was sent or retained
+        // in `owed_reads`. If the app is inactive, or the session is absent,
+        // keep the unread state so activation/reattach can retry the receipt.
+        if mark_locally && let Some(chat) = self.find_chat_mut(&jid) {
             chat.mark_as_read();
             // Both caches: the badge, and the is_read snapshot the message
             // list renders ticks from (its count guard can't see this).
@@ -2543,6 +2700,7 @@ impl WhatsAppApp {
                         app.avatar_manager.set_session(Some(client.handle()));
                         app.avatar_manager.flush_demands(&client);
                         app.client = Some(client);
+                        app.resume_visible_read(cx);
                         if let Ok((control, control_rx)) = control {
                             // Its frames answer through the control session's
                             // own request table; the reader just has to keep
@@ -2632,11 +2790,20 @@ impl WhatsAppApp {
                 let Some((jid, reply)) = self.pending_pastes.remove(paste_id) else {
                     return;
                 };
-                let quoted = self.take_reply_draft(reply, cx);
-                if self.send_attachment(&jid, file, quoted, cx)
-                    && self.visible_chat.as_deref() == Some(&jid)
-                {
-                    self.scroll_to_last_message();
+                let Some(format) = gpui::ImageFormat::from_mime_type(&file.mime_type) else {
+                    return;
+                };
+                if self.paste_preview.is_none() {
+                    let image = Arc::new(gpui::Image::from_bytes(format, file.bytes.clone()));
+                    let chat_was_visible = self.visible_chat.as_deref() == Some(jid.as_str());
+                    self.paste_preview = Some(PendingPastePreview {
+                        jid,
+                        reply,
+                        file,
+                        image,
+                        chat_was_visible,
+                    });
+                    cx.notify();
                 }
             }
             InputAreaEvent::PasteImageError(paste_id, error) => {
@@ -2916,6 +3083,7 @@ impl WhatsAppApp {
         chat_jid: String,
         mut message: ChatMessage,
         sender_name: Option<String>,
+        alert: IncomingAlert,
         cx: &mut App,
     ) {
         // Parse JID to determine chat type
@@ -2931,6 +3099,7 @@ impl WhatsAppApp {
         // receipt for a message nobody had laid eyes on.
         let read_now = read_is_allowed(
             self.window_focused,
+            crate::platform::application_is_active(),
             self.visible_chat.as_deref() == Some(chat_jid.as_str()),
             message.is_from_me,
         );
@@ -2948,6 +3117,19 @@ impl WhatsAppApp {
                 .or_else(|| self.name_cache.get(&message.sender).cloned());
         }
 
+        // Capture the user-facing part before the message moves into its
+        // conversation. Statuses have their own reader and do not represent a
+        // chat asking for attention; our own sends likewise never notify us.
+        let notification =
+            (alert.allowed && !read_now && !message.is_from_me && !is_status).then(|| {
+                let body = if is_group {
+                    format!("{}: {}", message.author_label(), message.preview_text())
+                } else {
+                    message.preview_text()
+                };
+                (message.id.clone(), message.sender.clone(), body)
+            });
+
         // Their message ends their typing, more reliably than `paused` does:
         // the peer that stopped composing is not obliged to say so, and a
         // sender whose message just arrived is definitively no longer
@@ -2964,6 +3146,9 @@ impl WhatsAppApp {
         if let Some(index) = chat_index {
             // Update the existing chat
             let chat = Arc::make_mut(&mut self.chats[index]);
+            if let Some(archived) = alert.archived {
+                chat.archived = archived;
+            }
 
             // For groups: update participant name, NOT the chat name
             if is_group {
@@ -3008,6 +3193,7 @@ impl WhatsAppApp {
             } else {
                 Chat::new(chat_jid.clone())
             };
+            new_chat.archived = alert.archived.unwrap_or(false);
 
             // For groups: track participant
             if is_group && let Some(ref name) = sender_name {
@@ -3038,10 +3224,224 @@ impl WhatsAppApp {
             self.invalidate_chat_cache();
             self.invalidate_message_cache(&chat_jid, cx);
         }
+
+        if let Some((message_id, sender, body)) = notification {
+            self.notify_incoming_message(&chat_jid, &message_id, &sender, body, alert.title, cx);
+        }
     }
 
-    /// Handle a receipt event (read/played status update)
-    /// A receipt about our own messages: advance their ticks.
+    /// Raise one operating-system notification for an incoming message.
+    ///
+    /// One stable tag per conversation lets a newer message replace the
+    /// previous banner instead of stacking an unbounded column. The bounded
+    /// id set is separate: reconnects can repeat a message after its banner
+    /// has already been delivered, and replacement alone would still make it
+    /// alert a second time.
+    fn notify_incoming_message(
+        &mut self,
+        chat_jid: &str,
+        message_id: &str,
+        sender: &str,
+        body: String,
+        notification_title: Option<String>,
+        cx: &mut App,
+    ) {
+        const REMEMBERED_MESSAGES: usize = 256;
+
+        let key = (
+            chat_jid.to_string(),
+            message_id.to_string(),
+            sender.to_string(),
+        );
+        if self.notified_messages.contains_key(&key) {
+            return;
+        }
+        let Some(chat) = self.find_chat(chat_jid) else {
+            return;
+        };
+        // The event's policy was read from the durable store after commit.
+        // This Chat may be a snapshot placeholder or a brand-new live row,
+        // so its mute/archive defaults cannot override that answer.
+        let title = notification_title.unwrap_or_else(|| {
+            if chat.is_group
+                && matches!(
+                    chat.name.as_str(),
+                    "Unnamed group" | "Group name unavailable"
+                )
+            {
+                "Group message".to_string()
+            } else {
+                chat.name.clone()
+            }
+        });
+        let avatar_key = chat.avatar_cache_key.clone();
+        self.notified_messages.insert(key, ());
+        while self.notified_messages.len() > REMEMBERED_MESSAGES {
+            self.notified_messages.shift_remove_index(0);
+        }
+        let tag = notification_tag(chat_jid);
+        let media_cache = self.media_cache();
+        // The native path can include a cached profile image as a content
+        // thumbnail. Its reader runs off the UI thread after macOS confirms
+        // authorization. Web builds and non-bundle tests stay on GPUI's path.
+        if !crate::platform::show_notification_with_avatar(&tag, &title, &body, move || {
+            let key = avatar_key.as_deref()?;
+            media_cache.as_ref()?.read(key).ok()
+        }) {
+            cx.show_system_notification(SystemNotification {
+                tag: tag.into(),
+                title: title.into(),
+                body: body.into(),
+                actions: Vec::new(),
+            });
+        }
+    }
+
+    /// Give notification responses a handle that remains usable after the
+    /// click callback returns. Hydration can finish later, so keeping only the
+    /// callback's `&mut Window` would make a retry impossible.
+    pub fn set_notification_window(&mut self, window: gpui::AnyWindowHandle) {
+        self.notification_window = Some(window);
+    }
+
+    /// Retry queued notification responses after a chat/list hydration pass.
+    ///
+    /// The retry is deferred until the current entity update unwinds. GPUI
+    /// does not permit re-entering an entity while it is applying an event,
+    /// and the stored [`WindowHandle`] is the supported way to obtain a live
+    /// `Window` for the normal selection path. The FIFO is drained in order:
+    /// an older unresolved tag cannot let a newer click be overwritten by a
+    /// late selection, and the newest queued tag is the final selection.
+    pub(super) fn retry_pending_notification(&mut self, cx: &mut Context<Self>) {
+        if self.pending_notification_tags.is_empty() {
+            self.notification_retry_task = None;
+            self.notification_retry_backoff = NOTIFICATION_PAGE_RETRY_DELAY;
+            return;
+        }
+        let Some(window) = self.notification_window else {
+            return;
+        };
+
+        let entity = cx.entity().downgrade();
+        cx.defer(move |cx| {
+            let tags = entity
+                .update(cx, |app, _| {
+                    app.pending_notification_tags
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for tag in tags {
+                let result = window.update(cx, |_, window, cx| {
+                    entity
+                        .update(cx, |app, cx| {
+                            app.retry_queued_notification(&tag, window, cx)
+                        })
+                        .unwrap_or(false)
+                });
+                if result.is_err() {
+                    // A closed window leaves the
+                    // queue intact. A later hydration/page-loss event can
+                    // retry it without losing a response.
+                    break;
+                }
+            }
+        });
+    }
+
+    /// Retry one queued tag. Every snapshot entry is attempted once so an
+    /// unresolved older click cannot block a newer chat that already
+    /// hydrated.
+    fn retry_queued_notification(
+        &mut self,
+        tag: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self
+            .pending_notification_tags
+            .iter()
+            .any(|queued| queued == tag)
+        {
+            return true;
+        }
+        if let Some(jid) = notification_chat_jid(&self.chats, tag) {
+            let should_select = self.latest_notification_tag.as_deref() == Some(tag);
+            remove_pending_notification(&mut self.pending_notification_tags, tag);
+            self.reset_notification_retry_backoff();
+            if should_select {
+                self.select_chat(jid, ChatOpen::ToPreview, window, cx);
+            }
+            return true;
+        }
+        if self
+            .request_notification_pages(cx)
+            .is_some_and(|plan| plan.done())
+        {
+            // Both complete scans say the tag is not held by this account.
+            remove_pending_notification(&mut self.pending_notification_tags, tag);
+            self.reset_notification_retry_backoff();
+            return true;
+        }
+        false
+    }
+
+    fn reset_notification_retry_backoff(&mut self) {
+        self.notification_retry_task = None;
+        self.notification_retry_backoff = NOTIFICATION_PAGE_RETRY_DELAY;
+    }
+
+    /// Back off a notification retry after a chat-list page refusal. One task
+    /// serves the queue, so repeated failures cannot create a tight retry
+    /// loop or duplicate requests.
+    pub(super) fn retry_pending_notification_after_page_loss(&mut self, cx: &mut Context<Self>) {
+        if self.pending_notification_tags.is_empty() || self.notification_retry_task.is_some() {
+            return;
+        }
+        let delay = self.notification_retry_backoff;
+        self.notification_retry_backoff = next_notification_retry_delay(delay);
+        let entity = cx.entity().downgrade();
+        self.notification_retry_task = Some(cx.spawn(async move |_, cx| {
+            crate::platform::sleep(delay).await;
+            let _ = entity.update(cx, |app, cx| {
+                app.notification_retry_task = None;
+                app.retry_pending_notification(cx);
+            });
+        }));
+    }
+
+    /// Open the conversation named by a system-notification response.
+    ///
+    /// The tag carries only a stable hash, not a phone number or JID. Resolve
+    /// it against chats this window already owns, then take the ordinary chat
+    /// selection path so paging, read bounds and group metadata stay intact.
+    pub fn open_system_notification(
+        &mut self,
+        tag: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.latest_notification_tag = Some(tag.to_string());
+        if let Some(jid) = notification_chat_jid(&self.chats, tag) {
+            remove_pending_notification(&mut self.pending_notification_tags, tag);
+            self.reset_notification_retry_backoff();
+            self.select_chat(jid, ChatOpen::ToPreview, window, cx);
+            // An older click may still be waiting; it remains queued for
+            // hydration but can no longer steal focus from this newer click.
+            self.retry_pending_notification(cx);
+            return;
+        }
+        // The response may arrive before the first HistoryLoaded/Chats page,
+        // or before the archived page that contains this chat. Queue it while
+        // unresolved; the hydrated branch above opens it immediately even if
+        // an older click is still waiting.
+        enqueue_pending_notification(&mut self.pending_notification_tags, tag);
+        self.retry_pending_notification(cx);
+    }
+
+    /// A server acknowledgement or peer receipt about our own messages:
+    /// advance their ticks.
     ///
     /// Only ever moves forward. Receipts arrive out of order and another of
     /// the peer's devices can repeat a delivery ack after the read one, so a
@@ -3053,13 +3453,8 @@ impl WhatsAppApp {
         receipt_type: ReceiptType,
         cx: &mut App,
     ) {
-        let status = match receipt_type {
-            ReceiptType::Delivered => MessageStatus::Delivered,
-            // Played is Read plus "and listened to it"; the ticks are the same.
-            ReceiptType::Read | ReceiptType::ReadSelf => MessageStatus::Read,
-            ReceiptType::Played | ReceiptType::PlayedSelf => MessageStatus::Read,
-            // Retries, errors and sender echoes say nothing about delivery.
-            _ => return,
+        let Some(status) = receipt_status(receipt_type.clone()) else {
+            return;
         };
 
         let Some(chat) = self.find_chat_mut(&chat_jid) else {
@@ -3274,6 +3669,21 @@ impl WhatsAppApp {
     }
 }
 
+/// The delivery state carried by one receipt, when it says anything the
+/// bubble can draw. `Sent` is the live projection of a positive server ack;
+/// durable history remains the recovery path if this event is dropped.
+fn receipt_status(receipt_type: ReceiptType) -> Option<MessageStatus> {
+    match receipt_type {
+        ReceiptType::Sent => Some(MessageStatus::Sent),
+        ReceiptType::Delivered => Some(MessageStatus::Delivered),
+        // Played is Read plus "and listened to it"; the ticks are the same.
+        ReceiptType::Read | ReceiptType::ReadSelf => Some(MessageStatus::Read),
+        ReceiptType::Played | ReceiptType::PlayedSelf => Some(MessageStatus::Read),
+        // Retries, errors and sender echoes say nothing about delivery.
+        _ => None,
+    }
+}
+
 /// The newest message in `chat` that the daemon can also name.
 ///
 /// `MarkRead` is a claim about what the requester saw, and the daemon checks it
@@ -3306,8 +3716,47 @@ fn read_bound(chat: &Chat) -> ReadBound {
     }
 }
 
-fn read_is_allowed(window_focused: bool, chat_visible: bool, is_from_me: bool) -> bool {
-    window_focused && chat_visible && !is_from_me
+fn chat_read_can_be_committed(
+    window_focused: bool,
+    application_active: bool,
+    client_available: bool,
+) -> bool {
+    window_focused && application_active && client_available
+}
+
+fn chat_read_needs_resume(chat: &Chat, owed: bool) -> bool {
+    owed || chat.unread_count > 0 || chat.manually_unread
+}
+
+fn read_is_allowed(
+    window_focused: bool,
+    application_active: bool,
+    chat_visible: bool,
+    is_from_me: bool,
+) -> bool {
+    window_focused && application_active && chat_visible && !is_from_me
+}
+
+/// Stable, opaque identity for one conversation's desktop notification.
+///
+/// The operating system persists notification tags, so the raw address does
+/// not belong in one. FNV-1a is sufficient here: this is replacement identity,
+/// not authentication, and the app resolves a response against the chats it
+/// already holds before opening anything.
+fn notification_tag(jid: &str) -> String {
+    let mut hash = 14_695_981_039_346_656_037u64;
+    for byte in jid.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(1_099_511_628_211);
+    }
+    format!("oxidezap-chat-{hash:016x}")
+}
+
+fn notification_chat_jid(chats: &[Arc<Chat>], tag: &str) -> Option<String> {
+    chats
+        .iter()
+        .find(|chat| notification_tag(&chat.jid) == tag)
+        .map(|chat| chat.jid.clone())
 }
 
 /// The newest message in `chat` that the daemon has also seen.
@@ -3508,9 +3957,22 @@ impl Render for WhatsAppApp {
             .then(|| render_call_overlay(self, window, cx))
             .flatten();
 
+        let paste_preview = self.paste_preview.as_ref().map(|preview| {
+            render_paste_preview(
+                preview.image.clone(),
+                cx.entity().clone(),
+                self.can_send(),
+                &self.paste_preview_focus,
+                cx.product().metrics,
+                cx,
+            )
+            .into_any_element()
+        });
+
         // The card is the one surface the root draws itself, so it is the
         // one the root answers for.
         let call_card = call_overlay.is_some();
+        let paste_preview_open = paste_preview.is_some();
 
         // Above the call card as well as the body: a notice raised by
         // something the call did is about the call, and a card that covered
@@ -3519,6 +3981,7 @@ impl Render for WhatsAppApp {
         // asks nothing of the conversation underneath it; the stack draws
         // nothing at all while it is empty.
         root.child(body.cached(gpui::StyleRefinement::default().size_full()))
+            .children(paste_preview)
             .children(call_overlay)
             .child(self.notices().clone())
             // Cached views report their surfaces in prepaint. Move focus after
@@ -3528,6 +3991,7 @@ impl Render for WhatsAppApp {
                     move |_, window, cx| {
                         entity.update(cx, |app, _| {
                             app.keyboard_surfaces.call_card = call_card;
+                            app.keyboard_surfaces.paste_preview = paste_preview_open;
                         });
                         let entity = entity.downgrade();
                         window.defer(cx, move |window, cx| {
@@ -3628,11 +4092,495 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_sent_receipt_replaces_only_the_outgoing_pending_clock() {
+        assert_eq!(receipt_status(ReceiptType::Sent), Some(MessageStatus::Sent));
+
+        let mut chat = Chat::new("12025550143@s.whatsapp.net".to_string());
+        let mut pending = ChatMessage::new_outgoing("ACKED-1".to_string(), "waiting".to_string());
+        pending.status = MessageStatus::Pending;
+        let mut delivered =
+            ChatMessage::new_outgoing("DELIVERED-1".to_string(), "already there".to_string());
+        delivered.status = MessageStatus::Delivered;
+        let mut failed =
+            ChatMessage::new_outgoing("FAILED-1".to_string(), "did not leave".to_string());
+        failed.status = MessageStatus::Failed;
+        let incoming = ChatMessage::new_incoming(
+            "INCOMING-1".to_string(),
+            "12025550143@s.whatsapp.net".to_string(),
+            "hello".to_string(),
+        );
+        chat.messages = vec![pending, delivered, failed, incoming];
+
+        assert_eq!(
+            chat.advance_status(&["ACKED-1".to_string()], MessageStatus::Sent),
+            1
+        );
+        assert_eq!(chat.messages[0].status, MessageStatus::Sent);
+        assert_eq!(
+            chat.advance_status(&["DELIVERED-1".to_string()], MessageStatus::Sent),
+            0,
+            "an older acknowledgement must not regress delivery"
+        );
+        assert_eq!(chat.messages[1].status, MessageStatus::Delivered);
+        assert_eq!(
+            chat.advance_status(&["FAILED-1".to_string()], MessageStatus::Sent),
+            0,
+            "a late acknowledgement must not revive a failed send"
+        );
+        assert_eq!(chat.messages[2].status, MessageStatus::Failed);
+        assert_eq!(
+            chat.advance_status(&["INCOMING-1".to_string()], MessageStatus::Sent),
+            0,
+            "our delivery state never belongs on an incoming message"
+        );
+    }
+
+    #[test]
     fn reads_require_a_focused_visible_chat() {
-        assert!(!read_is_allowed(false, true, false));
-        assert!(!read_is_allowed(true, false, false));
-        assert!(!read_is_allowed(true, true, true));
-        assert!(read_is_allowed(true, true, false));
+        assert!(!read_is_allowed(false, true, true, false));
+        assert!(!read_is_allowed(true, false, true, false));
+        assert!(!read_is_allowed(true, true, false, false));
+        assert!(!read_is_allowed(true, true, true, true));
+        assert!(read_is_allowed(true, true, true, false));
+    }
+
+    #[test]
+    fn chat_reads_stay_pending_until_window_and_client_can_commit_them() {
+        assert!(!chat_read_can_be_committed(false, true, true));
+        assert!(!chat_read_can_be_committed(true, false, true));
+        assert!(!chat_read_can_be_committed(true, true, false));
+        assert!(chat_read_can_be_committed(true, true, true));
+    }
+
+    #[test]
+    fn an_owed_read_is_resumed_after_local_badge_was_cleared() {
+        let mut row = chat("a@s.whatsapp.net", Some(10));
+        row.mark_as_read();
+
+        assert!(!chat_read_needs_resume(&row, false));
+        assert!(chat_read_needs_resume(&row, true));
+    }
+
+    #[test]
+    fn a_notification_tag_can_be_resolved_after_chat_hydration() {
+        let jid = "archived@example.invalid";
+        let tag = notification_tag(jid);
+        let mut chats = Vec::new();
+
+        // A response can arrive before either the active or archived page.
+        assert_eq!(notification_chat_jid(&chats, &tag), None);
+
+        let mut archived = Chat::with_name(jid.into(), "Archived contact".into());
+        archived.archived = true;
+        chats.push(Arc::new(archived));
+        assert_eq!(notification_chat_jid(&chats, &tag).as_deref(), Some(jid));
+    }
+
+    #[test]
+    fn notification_clicks_retry_in_fifo_order_with_newest_last() {
+        let mut queue = VecDeque::new();
+        enqueue_pending_notification(&mut queue, "chat-a");
+        enqueue_pending_notification(&mut queue, "chat-b");
+
+        assert_eq!(queue.pop_front().as_deref(), Some("chat-a"));
+        assert_eq!(queue.pop_front().as_deref(), Some("chat-b"));
+    }
+
+    #[test]
+    fn notification_click_queue_is_deduplicated_without_dropping_clicks() {
+        let mut queue = VecDeque::new();
+        enqueue_pending_notification(&mut queue, "chat-a");
+        enqueue_pending_notification(&mut queue, "chat-b");
+        enqueue_pending_notification(&mut queue, "chat-a");
+        assert_eq!(
+            queue.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["chat-b", "chat-a"]
+        );
+        enqueue_pending_notification(&mut queue, "chat-c");
+        assert_eq!(queue.len(), 3);
+        assert_eq!(queue.back().map(String::as_str), Some("chat-c"));
+    }
+
+    #[test]
+    fn notification_page_retry_backoff_doubles_and_is_capped() {
+        let mut delay = NOTIFICATION_PAGE_RETRY_DELAY;
+        assert_eq!(delay, std::time::Duration::from_millis(150));
+        for expected in [300, 600, 1_200, 2_400, 4_800, 9_600, 19_200] {
+            delay = next_notification_retry_delay(delay);
+            assert_eq!(delay, std::time::Duration::from_millis(expected));
+        }
+        assert_eq!(
+            next_notification_retry_delay(delay),
+            MAX_NOTIFICATION_PAGE_RETRY_DELAY
+        );
+        assert_eq!(
+            next_notification_retry_delay(MAX_NOTIFICATION_PAGE_RETRY_DELAY),
+            MAX_NOTIFICATION_PAGE_RETRY_DELAY
+        );
+    }
+
+    #[gpui::test]
+    fn queued_notification_clicks_select_newest_after_both_chats_hydrate(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            cx.set_app_identity("org.oxidezap.test", "OxideZap Test");
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            init_app_bindings(cx);
+        });
+        let mut app_entity = None;
+        let window = cx.open_window(gpui::size(gpui::px(1000.), gpui::px(800.)), |window, cx| {
+            let app = cx.new(|cx| {
+                let mut app = WhatsAppApp::new(cx);
+                app.app_state = AppState::Connected;
+                app.destination = Destination::Chats;
+                app
+            });
+            app_entity = Some(app.clone());
+            gpui_component::Root::new(app, window, cx)
+        });
+        let app = app_entity.unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+
+        let first_jid = "first@example.invalid";
+        let second_jid = "second@example.invalid";
+        let first_tag = notification_tag(first_jid);
+        let second_tag = notification_tag(second_jid);
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            app.update(cx, |app, cx| {
+                app.set_notification_window(window.window_handle());
+                app.open_system_notification(&first_tag, window, cx);
+                app.open_system_notification(&second_tag, window, cx);
+                assert_eq!(
+                    app.pending_notification_tags.iter().collect::<Vec<_>>(),
+                    [&first_tag, &second_tag]
+                );
+            });
+        });
+        // Both responses arrived before either row. Hydrate only the newer
+        // row first: an unresolved older entry must not block it.
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.chats.push(Arc::new(Chat::new(second_jid.to_string())));
+                app.retry_pending_notification(cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        cx.read(|cx| {
+            assert_eq!(app.read(cx).selected_chat.as_deref(), Some(second_jid));
+            assert_eq!(
+                app.read(cx)
+                    .pending_notification_tags
+                    .iter()
+                    .collect::<Vec<_>>(),
+                [&first_tag]
+            );
+        });
+
+        // The older tag is eventually consumed, but latest-click-wins keeps
+        // it from navigating away from the newer selection.
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.chats.push(Arc::new(Chat::new(first_jid.to_string())));
+                app.retry_pending_notification(cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        cx.read(|cx| {
+            assert_eq!(app.read(cx).selected_chat.as_deref(), Some(second_jid));
+            assert!(app.read(cx).pending_notification_tags.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn a_hydrated_newer_notification_opens_without_waiting_on_an_older_one(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            cx.set_app_identity("org.oxidezap.test", "OxideZap Test");
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            init_app_bindings(cx);
+        });
+        let mut app_entity = None;
+        let window = cx.open_window(gpui::size(gpui::px(1000.), gpui::px(800.)), |window, cx| {
+            let app = cx.new(|cx| {
+                let mut app = WhatsAppApp::new(cx);
+                app.app_state = AppState::Connected;
+                app.destination = Destination::Chats;
+                app
+            });
+            app_entity = Some(app.clone());
+            gpui_component::Root::new(app, window, cx)
+        });
+        let app = app_entity.unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+
+        let older_jid = "older@example.invalid";
+        let newer_jid = "newer@example.invalid";
+        let older_tag = notification_tag(older_jid);
+        let newer_tag = notification_tag(newer_jid);
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            app.update(cx, |app, cx| {
+                app.set_notification_window(window.window_handle());
+                app.open_system_notification(&older_tag, window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.chats.push(Arc::new(Chat::new(newer_jid.to_string())));
+                app.open_system_notification(&newer_tag, window, cx);
+                assert_eq!(app.selected_chat.as_deref(), Some(newer_jid));
+                assert_eq!(
+                    app.pending_notification_tags.iter().collect::<Vec<_>>(),
+                    [&older_tag]
+                );
+            });
+            window.draw(cx).clear(cx);
+        });
+
+        // The older tag is still retried, but its late resolution cannot
+        // steal focus from the newer click.
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.chats.push(Arc::new(Chat::new(older_jid.to_string())));
+                app.retry_pending_notification(cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        cx.read(|cx| {
+            assert_eq!(app.read(cx).selected_chat.as_deref(), Some(newer_jid));
+            assert!(app.read(cx).pending_notification_tags.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn an_incoming_message_outside_the_active_chat_raises_one_system_notification(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let app = cx.update(|cx| {
+            cx.set_app_identity("org.oxidezap.test", "OxideZap Test");
+            cx.new(|cx| {
+                let mut app = WhatsAppApp::new(cx);
+                app.chats.push(Arc::new(Chat::with_name(
+                    "peer@example.invalid".into(),
+                    "Example contact".into(),
+                )));
+                let mut muted =
+                    Chat::with_name("muted@example.invalid".into(), "Muted contact".into());
+                muted.muted_until = Some(chrono::DateTime::<chrono::Utc>::MAX_UTC);
+                app.chats.push(Arc::new(muted));
+                app.chats.push(Arc::new(Chat::with_name(
+                    "group@g.us".into(),
+                    "Example group".into(),
+                )));
+                app.visible_chat = Some("elsewhere@example.invalid".into());
+                app.window_focused = true;
+                app
+            })
+        });
+
+        for _ in 0..2 {
+            cx.update(|cx| {
+                app.update(cx, |app, cx| {
+                    app.handle_message_received(
+                        "peer@example.invalid".into(),
+                        ChatMessage::new_incoming(
+                            "MESSAGE-1".into(),
+                            "peer@example.invalid".into(),
+                            "New message".into(),
+                        ),
+                        Some("Example contact".into()),
+                        IncomingAlert::new(true, None, Some(false)),
+                        cx,
+                    );
+                });
+            });
+        }
+
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                app.handle_message_received(
+                    "muted@example.invalid".into(),
+                    ChatMessage::new_incoming(
+                        "MESSAGE-MUTED".into(),
+                        "muted@example.invalid".into(),
+                        "Quiet message".into(),
+                    ),
+                    Some("Muted contact".into()),
+                    IncomingAlert::new(false, None, None),
+                    cx,
+                );
+            });
+        });
+
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                // The phone has unmuted it, but this GUI row has not yet
+                // hydrated that change. The event's store decision wins.
+                app.handle_message_received(
+                    "muted@example.invalid".into(),
+                    ChatMessage::new_incoming(
+                        "MESSAGE-MUTED".into(),
+                        "muted@example.invalid".into(),
+                        "No longer quiet".into(),
+                    ),
+                    Some("Muted contact".into()),
+                    IncomingAlert::new(true, None, Some(false)),
+                    cx,
+                );
+            });
+        });
+
+        let notifications = cx.shown_system_notifications();
+        assert_eq!(
+            notifications.len(),
+            2,
+            "an ineligible delivery must not consume the deduplication key"
+        );
+        assert_eq!(notifications[0].title.as_ref(), "Example contact");
+        assert_eq!(notifications[0].body.as_ref(), "New message");
+        assert_eq!(notifications[1].title.as_ref(), "Muted contact");
+        assert_eq!(notifications[1].body.as_ref(), "No longer quiet");
+
+        for sender in ["member-a@example.invalid", "member-b@example.invalid"] {
+            cx.update(|cx| {
+                app.update(cx, |app, cx| {
+                    app.handle_message_received(
+                        "group@g.us".into(),
+                        ChatMessage::new_incoming(
+                            "COLLIDING-ID".into(),
+                            sender.into(),
+                            "Group message".into(),
+                        ),
+                        Some(sender.into()),
+                        IncomingAlert::new(true, None, Some(false)),
+                        cx,
+                    );
+                });
+            });
+        }
+        assert_eq!(
+            cx.shown_system_notifications().len(),
+            4,
+            "same message id from two group senders is two notifications"
+        );
+
+        // A live group may not be on any GUI page yet. An unknown store
+        // decision suppresses its first alert, and a known decision carries
+        // the durable subject even though this window has only a fallback.
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                app.handle_message_received(
+                    "new-group@g.us".into(),
+                    ChatMessage::new_incoming(
+                        "MESSAGE-NEW-1".into(),
+                        "member@example.invalid".into(),
+                        "Muted before hydration".into(),
+                    ),
+                    Some("Member".into()),
+                    IncomingAlert::new(false, Some("Stored subject".into()), None),
+                    cx,
+                );
+                app.handle_message_received(
+                    "new-group@g.us".into(),
+                    ChatMessage::new_incoming(
+                        "MESSAGE-NEW-2".into(),
+                        "member@example.invalid".into(),
+                        "Allowed before hydration".into(),
+                    ),
+                    Some("Member".into()),
+                    IncomingAlert::new(true, Some("Stored subject".into()), Some(false)),
+                    cx,
+                );
+            });
+        });
+        let notifications = cx.shown_system_notifications();
+        assert_eq!(notifications.len(), 5);
+        assert_eq!(notifications[4].title.as_ref(), "Stored subject");
+
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                app.handle_message_received(
+                    "archived-group@g.us".into(),
+                    ChatMessage::new_incoming(
+                        "MESSAGE-ARCHIVED-MENTION".into(),
+                        "member@example.invalid".into(),
+                        "Mentioned you".into(),
+                    ),
+                    Some("Member".into()),
+                    IncomingAlert::new(
+                        true,
+                        Some("Mentioned in Archived example".into()),
+                        Some(true),
+                    ),
+                    cx,
+                );
+                assert!(
+                    app.find_chat("archived-group@g.us")
+                        .is_some_and(|chat| chat.archived),
+                    "a mentioned archived group must not reappear in the active list"
+                );
+            });
+        });
+        assert_eq!(
+            cx.shown_system_notifications()[5].title.as_ref(),
+            "Mentioned in Archived example"
+        );
+
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                // The phone explicitly unarchived this conversation. The
+                // live store answer must remove it from Archived immediately,
+                // without waiting for a later paged history reload.
+                app.handle_message_received(
+                    "archived-group@g.us".into(),
+                    ChatMessage::new_incoming(
+                        "MESSAGE-UNARCHIVED".into(),
+                        "member@example.invalid".into(),
+                        "No longer archived".into(),
+                    ),
+                    Some("Member".into()),
+                    IncomingAlert::new(false, None, Some(false)),
+                    cx,
+                );
+                assert!(
+                    app.find_chat("archived-group@g.us")
+                        .is_some_and(|chat| !chat.archived)
+                );
+
+                // A frame without durable metadata is not an instruction to
+                // unarchive an already-known row (older daemon compatibility).
+                app.find_chat_mut("archived-group@g.us").unwrap().archived = true;
+                app.handle_message_received(
+                    "archived-group@g.us".into(),
+                    ChatMessage::new_incoming(
+                        "MESSAGE-UNKNOWN-ARCHIVE".into(),
+                        "member@example.invalid".into(),
+                        "Unknown archive state".into(),
+                    ),
+                    Some("Member".into()),
+                    IncomingAlert::new(false, None, None),
+                    cx,
+                );
+                assert!(
+                    app.find_chat("archived-group@g.us")
+                        .is_some_and(|chat| chat.archived)
+                );
+            });
+        });
+        assert_eq!(cx.shown_system_notifications().len(), 6);
     }
 
     fn at(secs: i64) -> Option<chrono::DateTime<chrono::Utc>> {

@@ -20,11 +20,13 @@
 //! and a real change emits `StoreChange::Chats` — which is what re-renders
 //! the list, with no extra publish step.
 //!
-//! The query shape is "selective, not N+1": unnamed groups cost one
-//! `fetch_overviews` each under a small concurrency cap, deduplicated per
-//! connection generation; channels cost a single `list_subscribed` that
-//! materializes every subscribed name at once, with a selective
-//! `get_metadata` only for channels absent from that list. A lookup that
+//! The query shape is bulk-first: a full pass uses one `list_participating`
+//! call for all groups, with a selective `fetch_overviews` fallback only for
+//! groups absent from that list (for example, a newly created group that has
+//! not appeared in the participating projection yet). Live sightings keep the
+//! selective lookup path, so a single new group does not refresh every group
+//! in the account. Channels use the same bulk-first shape with
+//! `list_subscribed` and selective `get_metadata` fallback. A lookup that
 //! fails is deliberately not remembered, so a transient failure is retried
 //! the next time its chat is sighted rather than filed as nameless for the
 //! life of the session.
@@ -110,6 +112,9 @@ const STORE_RETRY_LIMIT: u8 = 3;
 #[allow(clippy::manual_async_fn)]
 pub(crate) trait MetadataSource {
     fn group_subject(&self, jid: &Jid) -> impl Future<Output = NameLookup> + MaybeSend;
+    fn participating_groups(
+        &self,
+    ) -> impl Future<Output = Result<HashMap<String, String>, NameRetry>> + MaybeSend;
     fn subscribed_channels(
         &self,
     ) -> impl Future<Output = Result<HashMap<String, String>, NameRetry>> + MaybeSend;
@@ -144,6 +149,21 @@ impl MetadataSource for Client {
                         scope: retry.scope,
                     }
                 }
+            }
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn participating_groups(
+        &self,
+    ) -> impl Future<Output = Result<HashMap<String, String>, NameRetry>> + MaybeSend {
+        async move {
+            match self.groups().list_participating().await {
+                Ok(groups) => Ok(groups
+                    .into_iter()
+                    .map(|meta| (meta.id.to_string(), meta.subject.unwrap_or_default()))
+                    .collect()),
+                Err(e) => Err(name_retry_after(&e)),
             }
         }
     }
@@ -234,6 +254,12 @@ impl NameErrorBackoff for whatsapp_rust::features::NewsletterError {
 impl<T: MetadataSource + ?Sized> MetadataSource for Arc<T> {
     fn group_subject(&self, jid: &Jid) -> impl Future<Output = NameLookup> + MaybeSend {
         (**self).group_subject(jid)
+    }
+
+    fn participating_groups(
+        &self,
+    ) -> impl Future<Output = Result<HashMap<String, String>, NameRetry>> + MaybeSend {
+        (**self).participating_groups()
     }
 
     fn subscribed_channels(
@@ -546,6 +572,19 @@ fn usable_name(name: &str) -> bool {
     !name.trim().is_empty()
 }
 
+/// Whether a group subject is a real metadata answer rather than one of the
+/// labels this client generated for an unresolved row. These labels must stay
+/// eligible for another bulk/selective lookup, including rows written by older
+/// releases before the resolver existed.
+fn usable_stored_group_name(name: &str) -> bool {
+    let name = name.trim();
+    usable_name(name) && !matches!(name, "Unnamed group" | "Group name unavailable")
+}
+
+fn is_generated_group_placeholder(jid: &Jid, name: &str) -> bool {
+    jid.is_group() && matches!(name.trim(), "Unnamed group" | "Group name unavailable")
+}
+
 /// The stored special chats: every `@g.us` and `@newsletter` row, named or
 /// not — archived included, since the archived list draws them with the
 /// same fallback. A full pass revalidates them all rather than only the
@@ -732,7 +771,13 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
             // chats skip, failed-and-cooled chats retry.
             if !request.full
                 && !forced
-                && stored.as_deref().is_some_and(usable_name)
+                && stored.as_deref().is_some_and(|name| {
+                    if jid.is_group() {
+                        usable_stored_group_name(name)
+                    } else {
+                        usable_name(name)
+                    }
+                })
                 && !resolver.needs(&jid.to_string(), generation)
             {
                 continue;
@@ -769,7 +814,66 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
     let mut resolved: Vec<oxidezap_chat_store::ChatNameWrite> = Vec::new();
     let mut failed: Vec<(String, std::time::Duration)> = Vec::new();
     let mut global_backoff: Option<std::time::Duration> = None;
-    for (chunk_index, chunk) in groups.chunks(CHAT_NAME_CONCURRENCY).enumerate() {
+    // A full pass has enough scope to use the participating projection once
+    // for every group. Live sightings remain selective: a new group should
+    // not refresh the account-wide group list just to learn one subject.
+    let mut selective_groups = groups;
+    if request.full {
+        let listed = source.participating_groups();
+        tokio::pin!(listed);
+        let listed = tokio::select! {
+            out = &mut listed => out,
+            _ = stop.changed() => return,
+        };
+        match listed {
+            Ok(participating) => {
+                let mut fallback = Vec::new();
+                for jid in selective_groups {
+                    match participating.get(&jid.to_string()) {
+                        Some(name) if usable_name(name) => {
+                            let name = name.trim().to_owned();
+                            let key = jid.to_string();
+                            settled.push((key.clone(), Some(name.clone())));
+                            resolved.push(oxidezap_chat_store::ChatNameWrite::checked(
+                                jid,
+                                pre.get(&key).cloned().flatten(),
+                                name,
+                            ));
+                        }
+                        _ => fallback.push(jid),
+                    }
+                }
+                // The overview is authoritative for participating groups it
+                // contains. A row absent from a successful projection may be
+                // newly created or temporarily outside that projection, so it
+                // keeps the selective metadata fallback.
+                selective_groups = fallback
+                    .into_iter()
+                    .filter(|jid| resolver.needs(&jid.to_string(), generation))
+                    .collect();
+            }
+            Err(retry) => {
+                if retry.scope == RetryScope::Global {
+                    // A server-directed account-wide backoff must not fan out
+                    // one request per group into the same throttle window.
+                    global_backoff = Some(
+                        global_backoff
+                            .map_or(retry.retry_after, |current| current.max(retry.retry_after)),
+                    );
+                    failed.extend(
+                        selective_groups
+                            .iter()
+                            .map(|jid| (jid.to_string(), retry.retry_after)),
+                    );
+                    selective_groups.clear();
+                }
+                // A chat-scoped failure only means the participating list was
+                // unavailable. Keep the rows for their selective metadata
+                // fallback; each lookup has its own cooldown if it fails too.
+            }
+        }
+    }
+    for (chunk_index, chunk) in selective_groups.chunks(CHAT_NAME_CONCURRENCY).enumerate() {
         let lookup = whatsapp_rust::futures::future::join_all(chunk.iter().map(|jid| async {
             let name = source.group_subject(jid).await;
             (jid.clone(), name)
@@ -827,7 +931,7 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
             // window; those JIDs will be retried by the timer-driven pass.
             let remaining_start = (chunk_index + 1) * CHAT_NAME_CONCURRENCY;
             failed.extend(
-                groups
+                selective_groups
                     .iter()
                     .skip(remaining_start)
                     .map(|jid| (jid.to_string(), retry_after)),
@@ -1037,6 +1141,20 @@ pub(super) async fn run_pass<S: MetadataSource + ?Sized>(
                 match rows.get(&jid) {
                     Some(entry)
                         if learned_name.is_none()
+                            && jid.parse::<Jid>().ok().is_some_and(|jid| {
+                                entry
+                                    .name
+                                    .as_deref()
+                                    .is_some_and(|name| is_generated_group_placeholder(&jid, name))
+                            }) =>
+                    {
+                        // A blank answer cannot settle a row that only has a
+                        // generated placeholder. Keep it due so a later live
+                        // sighting can retry selective metadata lookup.
+                        resolver.forget(&jid, generation);
+                    }
+                    Some(entry)
+                        if learned_name.is_none()
                             || entry.name.as_deref() == learned_name.as_deref() =>
                     {
                         resolver.mark(&jid, generation);
@@ -1142,6 +1260,7 @@ impl WhatsAppClient {
 mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
     /// A metadata source the test drives: names on cue, failures and delays
@@ -1150,6 +1269,9 @@ mod tests {
         groups: StdMutex<HashMap<String, String>>,
         channels: StdMutex<HashMap<String, String>>,
         listed: StdMutex<Option<HashMap<String, String>>>,
+        participating_groups: StdMutex<Option<HashMap<String, String>>>,
+        group_list_calls: AtomicUsize,
+        group_lookup_calls: AtomicUsize,
         fail_groups: portable_atomic::AtomicBool,
         fail_list: portable_atomic::AtomicBool,
         fail_channel_global: portable_atomic::AtomicBool,
@@ -1161,6 +1283,9 @@ mod tests {
                 groups: StdMutex::new(HashMap::new()),
                 channels: StdMutex::new(HashMap::new()),
                 listed: StdMutex::new(Some(HashMap::new())),
+                participating_groups: StdMutex::new(Some(HashMap::new())),
+                group_list_calls: AtomicUsize::new(0),
+                group_lookup_calls: AtomicUsize::new(0),
                 fail_groups: portable_atomic::AtomicBool::new(false),
                 fail_list: portable_atomic::AtomicBool::new(false),
                 fail_channel_global: portable_atomic::AtomicBool::new(false),
@@ -1173,6 +1298,24 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(name.to_string(), subject.to_string());
+            fake
+        }
+
+        fn with_participating_groups(groups: &[(&str, &str)]) -> Self {
+            let fake = Self::new();
+            let mut all = fake
+                .participating_groups
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let participating = all.as_mut().expect("group list is present");
+            for (jid, subject) in groups {
+                fake.groups
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert((*jid).to_string(), (*subject).to_string());
+                participating.insert((*jid).to_string(), (*subject).to_string());
+            }
+            drop(all);
             fake
         }
 
@@ -1204,6 +1347,7 @@ mod tests {
     impl MetadataSource for FakeMeta {
         #[allow(clippy::manual_async_fn)]
         fn group_subject(&self, jid: &Jid) -> impl Future<Output = NameLookup> + MaybeSend {
+            self.group_lookup_calls.fetch_add(1, Ordering::Relaxed);
             let answer = if self.fail_groups.load(Ordering::Relaxed) {
                 NameLookup::Failed {
                     retry_after: NAME_RETRY_COOLDOWN,
@@ -1228,6 +1372,23 @@ mod tests {
                 }
             };
             async move { answer }
+        }
+
+        #[allow(clippy::manual_async_fn)]
+        fn participating_groups(
+            &self,
+        ) -> impl Future<Output = Result<HashMap<String, String>, NameRetry>> + MaybeSend {
+            self.group_list_calls.fetch_add(1, Ordering::Relaxed);
+            let listed = self
+                .participating_groups
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+                .ok_or(NameRetry {
+                    retry_after: NAME_RETRY_COOLDOWN,
+                    scope: RetryScope::Chat,
+                });
+            async move { listed }
         }
 
         #[allow(clippy::manual_async_fn)]
@@ -1279,6 +1440,7 @@ mod tests {
     }
 
     const GROUP: &str = "120363000000000001@g.us";
+    const GROUP_TWO: &str = "120363000000000002@g.us";
     const CHANNEL: &str = "120363400000000001@newsletter";
 
     async fn test_store(name: &str) -> Arc<ChatStore> {
@@ -1384,6 +1546,175 @@ mod tests {
             stored_name(&store, GROUP).await.as_deref(),
             Some("Trip planning")
         );
+        assert_eq!(source.group_list_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(source.group_lookup_calls.load(Ordering::Relaxed), 1);
+    }
+
+    /// A full revalidation uses the participating overview once for all
+    /// groups, without falling back to one metadata IQ per row.
+    #[tokio::test]
+    async fn a_full_pass_uses_bulk_group_overviews() {
+        let store = test_store("group-bulk-overviews").await;
+        feed(&store, group_message(GROUP, "MSG-GB1")).await;
+        feed(&store, group_message(GROUP_TWO, "MSG-GB2")).await;
+
+        let source = FakeMeta::with_participating_groups(&[
+            (GROUP, "Trip planning"),
+            (GROUP_TWO, "Dinner plans"),
+        ]);
+        let signal = ChatNameResolveSignal::new();
+        signal.request_full();
+        let request = signal.next().await;
+        let mut resolver = NameResolver::new();
+        drive(&source, &store, &signal, &mut resolver, request).await;
+
+        assert_eq!(
+            stored_name(&store, GROUP).await.as_deref(),
+            Some("Trip planning")
+        );
+        assert_eq!(
+            stored_name(&store, GROUP_TWO).await.as_deref(),
+            Some("Dinner plans")
+        );
+        assert_eq!(source.group_list_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(source.group_lookup_calls.load(Ordering::Relaxed), 0);
+    }
+
+    /// The server is authoritative for subjects: a person may intentionally
+    /// choose the same text as our fallback, and that custom name must not be
+    /// filtered merely because it matches a sentinel.
+    #[tokio::test]
+    async fn a_server_group_subject_matching_the_fallback_is_preserved() {
+        let store = test_store("group-custom-fallback-text").await;
+        feed(&store, group_message(GROUP, "MSG-GB8")).await;
+
+        let source = FakeMeta::with_participating_groups(&[(GROUP, "Unnamed group")]);
+        let signal = ChatNameResolveSignal::new();
+        signal.request_full();
+        let request = signal.next().await;
+        let mut resolver = NameResolver::new();
+        drive(&source, &store, &signal, &mut resolver, request).await;
+
+        assert_eq!(
+            stored_name(&store, GROUP).await.as_deref(),
+            Some("Unnamed group")
+        );
+        assert_eq!(source.group_list_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(source.group_lookup_calls.load(Ordering::Relaxed), 0);
+    }
+
+    /// A successful bulk projection still keeps a selective fallback for a
+    /// newly sighted row that the server did not return in its projection.
+    #[tokio::test]
+    async fn a_full_pass_selectively_falls_back_for_an_unlisted_group() {
+        let store = test_store("group-bulk-fallback").await;
+        feed(&store, group_message(GROUP, "MSG-GB3")).await;
+        feed(&store, group_message(GROUP_TWO, "MSG-GB4")).await;
+
+        let source = FakeMeta::with_participating_groups(&[(GROUP, "Trip planning")]);
+        source.rename_group(GROUP_TWO, "Dinner plans");
+        let signal = ChatNameResolveSignal::new();
+        signal.request_full();
+        let request = signal.next().await;
+        let mut resolver = NameResolver::new();
+        drive(&source, &store, &signal, &mut resolver, request).await;
+
+        assert_eq!(
+            stored_name(&store, GROUP).await.as_deref(),
+            Some("Trip planning")
+        );
+        assert_eq!(
+            stored_name(&store, GROUP_TWO).await.as_deref(),
+            Some("Dinner plans")
+        );
+        assert_eq!(source.group_list_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(source.group_lookup_calls.load(Ordering::Relaxed), 1);
+    }
+
+    /// A failed participating projection still falls back to a selective
+    /// lookup when the failure is chat-scoped, so a full pass can name rows
+    /// even when the account-wide list is temporarily unavailable.
+    #[tokio::test]
+    async fn a_failed_bulk_group_list_falls_back_to_selective_lookup() {
+        let store = test_store("group-bulk-list-failure").await;
+        feed(&store, group_message(GROUP, "MSG-GB5")).await;
+
+        let source = FakeMeta::with_group(GROUP, "Trip planning");
+        *source
+            .participating_groups
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        let signal = ChatNameResolveSignal::new();
+        signal.request_full();
+        let request = signal.next().await;
+        let mut resolver = NameResolver::new();
+        drive(&source, &store, &signal, &mut resolver, request).await;
+
+        assert_eq!(
+            stored_name(&store, GROUP).await.as_deref(),
+            Some("Trip planning")
+        );
+        assert_eq!(source.group_list_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(source.group_lookup_calls.load(Ordering::Relaxed), 1);
+    }
+
+    /// A participating overview without a usable subject keeps its selective
+    /// fallback, because the slim projection did not actually answer the name.
+    #[tokio::test]
+    async fn an_empty_bulk_group_subject_falls_back_to_selective_lookup() {
+        let store = test_store("group-empty-bulk-subject").await;
+        feed(&store, group_message(GROUP, "MSG-GB6")).await;
+
+        let source = FakeMeta::with_participating_groups(&[(GROUP, "")]);
+        source.rename_group(GROUP, "Trip planning");
+        let signal = ChatNameResolveSignal::new();
+        signal.request_full();
+        let request = signal.next().await;
+        let mut resolver = NameResolver::new();
+        drive(&source, &store, &signal, &mut resolver, request).await;
+
+        assert_eq!(
+            stored_name(&store, GROUP).await.as_deref(),
+            Some("Trip planning")
+        );
+        assert_eq!(source.group_list_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(source.group_lookup_calls.load(Ordering::Relaxed), 1);
+    }
+
+    /// A generated label already persisted by an older build must not be
+    /// settled as a real subject. If the first pass also gets no subject, a
+    /// later sighting still gets a selective lookup after the server has a
+    /// usable answer.
+    #[tokio::test]
+    async fn a_generated_group_label_does_not_block_a_later_selective_recovery() {
+        let store = test_store("group-placeholder-recovery").await;
+        feed(&store, group_message(GROUP, "MSG-GB7")).await;
+        store
+            .set_chat_name(&GROUP.parse().expect("test JID"), "Unnamed group")
+            .expect("queue legacy placeholder");
+        store.flush().await.expect("persist placeholder");
+
+        let source = FakeMeta::with_participating_groups(&[(GROUP, "")]);
+        let signal = ChatNameResolveSignal::new();
+        signal.request_full();
+        let request = signal.next().await;
+        let mut resolver = NameResolver::new();
+        drive(&source, &store, &signal, &mut resolver, request).await;
+        assert_eq!(
+            stored_name(&store, GROUP).await.as_deref(),
+            Some("Unnamed group")
+        );
+
+        source.rename_group(GROUP, "Trip planning");
+        signal.request_named([GROUP.to_string()]);
+        let request = signal.next().await;
+        drive(&source, &store, &signal, &mut resolver, request).await;
+
+        assert_eq!(
+            stored_name(&store, GROUP).await.as_deref(),
+            Some("Trip planning")
+        );
+        assert_eq!(source.group_lookup_calls.load(Ordering::Relaxed), 2);
     }
 
     /// A live channel message resolves through the subscribed list, with no
@@ -1744,6 +2075,13 @@ mod tests {
                     self.gate.release.notified().await;
                     self.inner.group_subject(jid).await
                 }
+            }
+            #[allow(clippy::manual_async_fn)]
+            fn participating_groups(
+                &self,
+            ) -> impl Future<Output = Result<HashMap<String, String>, NameRetry>> + MaybeSend
+            {
+                async move { Ok(HashMap::new()) }
             }
             #[allow(clippy::manual_async_fn)]
             fn subscribed_channels(

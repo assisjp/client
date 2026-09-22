@@ -13,6 +13,70 @@ mod common;
 
 use common::*;
 
+#[tokio::test]
+async fn alias_reconcile_keeps_explicit_unmute_and_unarchive_over_history() {
+    let (store, chat_store) = test_store().await;
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("phone side"),
+                incoming_info(PEER, PEER, "MSG-PN-PREF", 1_700_000_000),
+            ),
+            Event::MuteUpdate(
+                wacore::types::events::MuteUpdate::builder()
+                    .jid(jid(PEER))
+                    .timestamp(ts(1_700_000_001))
+                    .action(Box::new(wa::sync_action_value::MuteAction {
+                        muted: Some(false),
+                        ..Default::default()
+                    }))
+                    .from_full_sync(false)
+                    .build(),
+            ),
+            Event::ArchiveUpdate(
+                wacore::types::events::ArchiveUpdate::builder()
+                    .jid(jid(PEER))
+                    .timestamp(ts(1_700_000_001))
+                    .action(Box::new(wa::sync_action_value::ArchiveChatAction {
+                        archived: Some(false),
+                        ..Default::default()
+                    }))
+                    .from_full_sync(false)
+                    .build(),
+            ),
+            message_event(
+                wa::Message::text("newer LID side"),
+                incoming_info(PEER_LID, PEER_LID, "MSG-LID-PREF", 1_700_000_100),
+            ),
+            history_sync_event(wa::HistorySync {
+                sync_type: wa::history_sync::HistorySyncType::RECENT,
+                conversations: vec![wa::Conversation {
+                    id: PEER_LID.into(),
+                    conversation_timestamp: Some(1_700_000_100),
+                    mute_end_time: Some(1_900_000_000),
+                    archived: Some(true),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        ],
+    )
+    .await;
+    add_lid_mapping(&store).await;
+    chat_store.reconcile_chat(&jid(PEER)).unwrap();
+    chat_store.flush().await.unwrap();
+
+    let state = chat_store
+        .notification_metadata(&jid(PEER_LID))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!state.muted);
+    assert!(!state.archived);
+    assert!(state.allowed);
+}
+
 /// The issue #1078 scenario: rows stored under the phone-number key before
 /// any mapping was known, delivered/read receipts arriving LID-keyed.
 #[tokio::test]

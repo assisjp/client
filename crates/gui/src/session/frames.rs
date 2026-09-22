@@ -226,10 +226,14 @@ impl<'a> Frames<'a> {
                 mut chats,
                 next,
             } => {
-                if take_pending(self.pending, id).is_none() {
+                let Some(Awaiting::Page {
+                    jid: None,
+                    archived,
+                }) = take_pending(self.pending, id)
+                else {
                     debug!("a chat page arrived for {id}, which nobody is waiting on");
                     return ControlFlow::Continue(());
-                }
+                };
                 // A chat page carries one message per row and that row is the
                 // list's preview: its media is externalized like any other, so
                 // it has to be read back here like any other. Skipping it drew
@@ -239,7 +243,11 @@ impl<'a> Frames<'a> {
                         fill(&mut message.media, self.media);
                     }
                 }
-                self.publish(FromDaemon::Chats { chats, next })?;
+                self.publish(FromDaemon::Chats {
+                    chats,
+                    next,
+                    archived,
+                })?;
             }
             DaemonMessage::GroupMembers { id, roster } => {
                 if take_pending(self.pending, id).is_none() {

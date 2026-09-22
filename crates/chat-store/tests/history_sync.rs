@@ -8,6 +8,178 @@ mod common;
 
 use common::*;
 
+/// A message can create the row before the conversation snapshot arrives.
+/// History supplies the initial mute/archive state, but an explicit app-state
+/// update (including false/NULL) outranks any stale snapshot replay.
+#[tokio::test]
+async fn history_prefills_live_row_without_overwriting_appstate() {
+    let (_store, chat_store) = test_store().await;
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("first"),
+            incoming_info(PEER, PEER, "MSG-PREF", 1_700_000_000),
+        )],
+    )
+    .await;
+    assert!(
+        chat_store
+            .notification_metadata(&jid(PEER))
+            .await
+            .unwrap()
+            .unwrap()
+            .allowed
+    );
+
+    let snapshot = |muted: bool, archived: bool| {
+        history_sync_event(wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::RECENT,
+            conversations: vec![wa::Conversation {
+                id: PEER.into(),
+                conversation_timestamp: Some(1_700_000_000),
+                mute_end_time: muted.then_some(1_900_000_000),
+                archived: Some(archived),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+    };
+    feed(&chat_store, [snapshot(true, true)]).await;
+    let state = chat_store
+        .notification_metadata(&jid(PEER))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(state.muted);
+    assert!(state.archived);
+    assert!(!state.allowed);
+
+    // A later history chunk may still refresh both fields before any
+    // app-state event has established a newer authoritative value.
+    feed(&chat_store, [snapshot(false, false)]).await;
+    assert!(
+        chat_store
+            .notification_metadata(&jid(PEER))
+            .await
+            .unwrap()
+            .unwrap()
+            .allowed
+    );
+
+    feed(
+        &chat_store,
+        [
+            Event::MuteUpdate(
+                wacore::types::events::MuteUpdate::builder()
+                    .jid(jid(PEER))
+                    .timestamp(ts(1_700_000_100))
+                    .action(Box::new(wa::sync_action_value::MuteAction {
+                        muted: Some(false),
+                        ..Default::default()
+                    }))
+                    .from_full_sync(false)
+                    .build(),
+            ),
+            Event::ArchiveUpdate(
+                wacore::types::events::ArchiveUpdate::builder()
+                    .jid(jid(PEER))
+                    .timestamp(ts(1_700_000_100))
+                    .action(Box::new(wa::sync_action_value::ArchiveChatAction {
+                        archived: Some(false),
+                        ..Default::default()
+                    }))
+                    .from_full_sync(false)
+                    .build(),
+            ),
+        ],
+    )
+    .await;
+    feed(&chat_store, [snapshot(true, true)]).await;
+    let state = chat_store
+        .notification_metadata(&jid(PEER))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!state.muted);
+    assert!(!state.archived);
+    assert!(state.allowed);
+}
+
+#[tokio::test]
+async fn missing_preference_options_do_not_unmute_or_unarchive() {
+    let (_store, chat_store) = test_store().await;
+    let snapshot = |muted: bool, archived: Option<bool>| {
+        history_sync_event(wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::RECENT,
+            conversations: vec![wa::Conversation {
+                id: PEER.into(),
+                conversation_timestamp: Some(1_700_000_000),
+                // Present zero is an explicit unmute on the wire, not a
+                // missing preference.
+                mute_end_time: Some(if muted { 1_900_000_000 } else { 0 }),
+                archived,
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+    };
+    feed(&chat_store, [snapshot(true, Some(true))]).await;
+    feed(
+        &chat_store,
+        [
+            Event::MuteUpdate(
+                wacore::types::events::MuteUpdate::builder()
+                    .jid(jid(PEER))
+                    .timestamp(ts(1_700_000_100))
+                    .action(Box::new(wa::sync_action_value::MuteAction::default()))
+                    .from_full_sync(false)
+                    .build(),
+            ),
+            Event::ArchiveUpdate(
+                wacore::types::events::ArchiveUpdate::builder()
+                    .jid(jid(PEER))
+                    .timestamp(ts(1_700_000_100))
+                    .action(Box::new(wa::sync_action_value::ArchiveChatAction::default()))
+                    .from_full_sync(false)
+                    .build(),
+            ),
+        ],
+    )
+    .await;
+    let state = chat_store
+        .notification_metadata(&jid(PEER))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(state.muted);
+    assert!(state.archived);
+
+    feed(&chat_store, [snapshot(true, None)]).await;
+    assert!(
+        chat_store
+            .notification_metadata(&jid(PEER))
+            .await
+            .unwrap()
+            .unwrap()
+            .archived
+    );
+
+    // An explicit unmute and unarchive from history still apply: the missing
+    // actions above must not have marked either preference app-state authoritative.
+    feed(&chat_store, [snapshot(false, Some(false))]).await;
+    let state = chat_store
+        .notification_metadata(&jid(PEER))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!state.muted);
+    assert!(!state.archived);
+    assert!(state.allowed);
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    let chat = chats.iter().find(|chat| chat.jid == jid(PEER)).unwrap();
+    assert!(chat.muted_until.is_none());
+}
+
 #[tokio::test]
 async fn history_sync_materializes_without_clobbering_live_rows() {
     let (_store, chat_store) = test_store().await;

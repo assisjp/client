@@ -45,6 +45,6 @@ pub use materialize::is_control_only;
 pub use store::ChatStore;
 pub use types::{
     ArrivalCursor, AvatarDescriptor, ChatCursor, ChatEntry, ChatNameExpected, ChatNameWrite,
-    ContactEntry, MediaRef, MessageCoverage, MessageCursor, MessageKind, MessageStatus,
-    ReactionEntry, ReceiptEntry, StoreChange, StoredMessage,
+    ChatNotificationMetadata, ContactEntry, MediaRef, MessageCoverage, MessageCursor, MessageKind,
+    MessageStatus, ReactionEntry, ReceiptEntry, StoreChange, StoredMessage,
 };

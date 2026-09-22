@@ -278,6 +278,11 @@ impl StateHub {
         self.state.chat(jid)
     }
 
+    /// Whether the active store list deliberately excluded this chat.
+    pub fn chat_is_inactive(&self, jid: &str) -> bool {
+        self.state.chat_is_inactive(jid)
+    }
+
     /// The JIDs a complete store reload is allowed to contradict. See
     /// [`StateStore::store_backed_chat_jids`].
     pub fn store_backed_chat_jids(&self) -> Vec<String> {
@@ -634,6 +639,19 @@ mod tests {
 
         hub.apply(removed("a@s.whatsapp.net"));
         assert_eq!(tray.borrow_and_update().unread, 4);
+    }
+
+    #[test]
+    fn a_removed_chat_stays_inactive_until_the_store_restores_it() {
+        let hub = StateHub::new();
+        hub.apply(stored(chat("a@s.whatsapp.net", 1, 10)));
+        hub.apply(removed("a@s.whatsapp.net"));
+        assert!(hub.chat_is_inactive("a@s.whatsapp.net"));
+
+        // A store-backed row is the authoritative answer that this address
+        // is active again (unarchived or recreated).
+        hub.apply(stored(chat("a@s.whatsapp.net", 1, 20)));
+        assert!(!hub.chat_is_inactive("a@s.whatsapp.net"));
     }
 
     /// Receipts and typing churn state constantly. The tray must not wake for

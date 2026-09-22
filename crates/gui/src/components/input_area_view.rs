@@ -7,14 +7,11 @@ use std::{cell::RefCell, rc::Rc, time::Duration};
 
 use wacore::time::Instant;
 
-use gpui::{
-    App, Entity, EventEmitter, Focusable as _, KeyDownEvent, Task, WeakEntity, Window, div,
-    prelude::*,
-};
+use gpui::{App, Entity, EventEmitter, Focusable as _, Task, WeakEntity, Window, div, prelude::*};
 use gpui_component::{
     ActiveTheme, Disableable as _, Icon, IconName, Sizable as _,
     button::{Button, ButtonVariants},
-    input::{InputEvent, Textarea, TextareaState},
+    input::{InputEvent, Paste, Textarea, TextareaState},
 };
 
 use crate::components::{ProductIcon, parts};
@@ -484,17 +481,9 @@ impl InputAreaView {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .on_key_down(cx.listener(|view, event: &KeyDownEvent, _window, cx| {
-                        let modifiers = &event.keystroke.modifiers;
-                        if event.keystroke.key.eq_ignore_ascii_case("v")
-                            && modifiers.secondary()
-                            && !modifiers.alt
-                            && !modifiers.shift
-                            && !modifiers.function
-                        {
-                            view.paste_image(cx);
-                        }
-                    }))
+                    .capture_action::<Paste>(
+                        cx.listener(|view, _: &Paste, _window, cx| view.paste_image(cx)),
+                    )
                     .child(Textarea::new(&self.input).w_full()),
             )
             .child(
@@ -689,4 +678,147 @@ fn render_reply_bar(
                     entity.update(cx, |view, cx| view.clear_reply(cx));
                 }),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::RefCell, rc::Rc, sync::Arc};
+
+    use gpui::{
+        AppContext as _, ClipboardItem, Entity, Image, ImageFormat, IntoElement, Keystroke,
+        ParentElement, Render, Styled as _, Subscription, Window, div, px, size,
+    };
+
+    use super::{InputAreaEvent, InputAreaView};
+
+    struct ComposerHarness {
+        input: Entity<InputAreaView>,
+    }
+
+    struct ComposerFixture {
+        cx: gpui::HeadlessAppContext,
+        window: gpui::WindowHandle<ComposerHarness>,
+        input: Entity<InputAreaView>,
+        pasted_images: Rc<RefCell<Vec<Vec<u8>>>>,
+        _events: Subscription,
+    }
+
+    impl ComposerHarness {
+        fn new(window: &mut Window, cx: &mut gpui::Context<Self>) -> Self {
+            let input = cx.new(|cx| InputAreaView::new(window, cx));
+            Self { input }
+        }
+    }
+
+    impl Render for ComposerHarness {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut gpui::Context<Self>,
+        ) -> impl IntoElement {
+            div().size_full().child(self.input.clone())
+        }
+    }
+
+    fn setup() -> ComposerFixture {
+        let mut cx = gpui::HeadlessAppContext::with_asset_source(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("DejaVu Sans")),
+            Arc::new(crate::assets::Assets),
+        );
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let window = cx
+            .open_window(size(px(640.), px(120.)), |window, cx| {
+                cx.new(|cx| ComposerHarness::new(window, cx))
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let input = window
+            .update(&mut cx, |harness, _, _| harness.input.clone())
+            .unwrap();
+        let pasted_images = Rc::new(RefCell::new(Vec::new()));
+        let observed = pasted_images.clone();
+        let events = cx.update(|cx| {
+            cx.subscribe(&input, move |_, event: &InputAreaEvent, _| {
+                if let InputAreaEvent::PasteImage(_, file) = event
+                    && let Some(file) = file.borrow().as_ref()
+                {
+                    observed.borrow_mut().push(file.bytes.clone());
+                }
+            })
+        });
+        cx.update_window(*window, |_, window, cx| {
+            input.read(cx).focus_handle(cx).focus(window, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        ComposerFixture {
+            cx,
+            window,
+            input,
+            pasted_images,
+            _events: events,
+        }
+    }
+
+    fn paste_shortcut() -> Keystroke {
+        Keystroke::parse(if cfg!(target_os = "macos") {
+            "cmd-v"
+        } else {
+            "ctrl-v"
+        })
+        .unwrap()
+    }
+
+    fn paste(cx: &mut gpui::HeadlessAppContext, window: &gpui::WindowHandle<ComposerHarness>) {
+        cx.update_window((*window).into(), |_, window, cx| {
+            window.dispatch_keystroke(paste_shortcut(), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[test]
+    fn focused_composer_pastes_a_clipboard_image() {
+        let ComposerFixture {
+            mut cx,
+            window,
+            pasted_images,
+            _events,
+            ..
+        } = setup();
+        let bytes = vec![1, 2, 3, 4];
+        cx.update(|cx| {
+            cx.write_to_clipboard(ClipboardItem::new_image(&Image {
+                format: ImageFormat::Png,
+                bytes: bytes.clone(),
+                id: 0,
+            }));
+        });
+
+        paste(&mut cx, &window);
+
+        let pasted = pasted_images.borrow().clone();
+        assert_eq!(pasted, vec![bytes]);
+    }
+
+    #[test]
+    fn focused_composer_still_pastes_text_once() {
+        let ComposerFixture {
+            mut cx,
+            window,
+            input,
+            pasted_images,
+            _events,
+            ..
+        } = setup();
+        cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string("hello".into())));
+
+        paste(&mut cx, &window);
+
+        cx.update(|cx| assert_eq!(input.read(cx).input.read(cx).text(), "hello"));
+        assert!(pasted_images.borrow().is_empty());
+    }
 }

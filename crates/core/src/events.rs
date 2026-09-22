@@ -59,6 +59,21 @@ pub enum UiEvent {
         chat_jid: String,
         message: Box<ChatMessage>,
         sender_name: Option<String>,
+        /// A live, committed message in a known, unmuted, unarchived chat.
+        /// Missing from an older daemon's frame means unknown and suppresses
+        /// the alert; the GUI still owns focus and duplicate filtering.
+        #[serde(default)]
+        notification_allowed: bool,
+        /// Resolved from durable chat metadata when available, so a message
+        /// arriving before GUI hydration does not title the banner with a JID
+        /// or a generated group placeholder.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notification_title: Option<String>,
+        /// The store's archive answer. `None` means not known (including an
+        /// older daemon frame), distinct from an explicit unarchive. A live
+        /// @mention may still alert without resurrecting an archived chat.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notification_archived: Option<bool>,
     },
     ReceiptReceived {
         chat_jid: String,
@@ -371,5 +386,44 @@ mod receipt_wire {
     ) -> Result<ReceiptType, D::Error> {
         let wire = String::deserialize(deserializer)?;
         Ok(ReceiptType::parse(&wire))
+    }
+}
+
+#[cfg(test)]
+mod notification_wire_tests {
+    use super::UiEvent;
+
+    #[test]
+    fn older_message_frame_without_policy_is_not_allowed_to_alert() {
+        let event = UiEvent::MessageReceived {
+            chat_jid: "group@g.us".into(),
+            message: Box::new(crate::fixtures::message(
+                "MESSAGE-1",
+                "member@example.invalid",
+                "example",
+            )),
+            sender_name: None,
+            notification_allowed: true,
+            notification_title: Some("Example group".into()),
+            notification_archived: Some(true),
+        };
+        let mut wire = serde_json::to_value(event).unwrap();
+        let fields = wire
+            .get_mut("message_received")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        fields.remove("notification_allowed");
+        fields.remove("notification_title");
+        fields.remove("notification_archived");
+        let older: UiEvent = serde_json::from_value(wire).unwrap();
+        assert!(matches!(
+            older,
+            UiEvent::MessageReceived {
+                notification_allowed: false,
+                notification_title: None,
+                notification_archived: None,
+                ..
+            }
+        ));
     }
 }

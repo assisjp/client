@@ -97,6 +97,16 @@ openh264 = "0.9" # H.264 software decoder
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
 
+# Native notification authorization and the process-level active state. GPUI
+# already uses this objc2 family internally; declared because this crate calls
+# the platform APIs directly.
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSArray", "NSBundle", "NSDictionary", "NSError", "NSObject", "NSString", "NSURL", "std"] }
+objc2-user-notifications = { version = "0.3", default-features = false, features = ["block2", "UNNotificationAttachment", "UNNotificationContent", "UNNotificationRequest", "UNNotificationSettings", "UNNotificationTrigger", "UNUserNotificationCenter"] }
+
 # The same window as a page. `gpui_platform` picks the web backend by target,
 # so the dependency differs only in the features a browser has no use for —
 # there is no font-kit, no X11 and no Wayland behind a canvas.

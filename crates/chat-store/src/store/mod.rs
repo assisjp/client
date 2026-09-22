@@ -769,6 +769,21 @@ mod migration_tests {
         .expect("create store");
         ChatStore::new(&store).await.expect("run migrations");
 
+        // The current top migration only tracks which source last supplied
+        // mute/archive preferences. Revert it first so the historical
+        // downgrade assertions below still start at account-cascade.
+        store
+            .shared()
+            .run(|conn| {
+                conn.revert_last_migration(MIGRATIONS)
+                    .map(|_| ())
+                    .map_err(StoreError::Migration)
+            })
+            .await
+            .expect("preference-provenance downgrade is reversible");
+        assert!(!has_column(&store, "chats", "mute_appstate_seen").await);
+        assert!(!has_column(&store, "chats", "archive_appstate_seen").await);
+
         // Reverted in reverse application order. On top is the account-cascade
         // follow-up: it only adds the `device` foreign key to the descriptors
         // and the labels table, so reverting it leaves both in place without

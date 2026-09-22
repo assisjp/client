@@ -27,7 +27,7 @@ pub fn fallback_chat_name(jid: &Jid) -> String {
     if jid.is_status_broadcast() {
         "Status".to_string()
     } else if jid.is_group() {
-        "Unnamed group".to_string()
+        "Group name unavailable".to_string()
     } else if jid.is_broadcast_list() {
         "Broadcast list".to_string()
     } else if jid.is_newsletter() {
@@ -38,6 +38,17 @@ pub fn fallback_chat_name(jid: &Jid) -> String {
         format!("+{}", jid.user_base())
     } else {
         "Unknown chat".to_string()
+    }
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::fallback_chat_name;
+
+    #[test]
+    fn group_without_recoverable_subject_has_an_honest_label() {
+        let group = "120363000000000001@g.us".parse().expect("synthetic group");
+        assert_eq!(fallback_chat_name(&group), "Group name unavailable");
     }
 }
 
@@ -100,6 +111,14 @@ pub struct Chat {
     /// of the list; the store owns the timestamp and hydration restores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned_at: Option<DateTime<Utc>>,
+    /// Until when desktop alerts for this conversation are muted.
+    /// `DateTime::MAX_UTC` represents a mute without expiry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub muted_until: Option<DateTime<Utc>>,
+    /// Whether WhatsApp keeps this conversation in the archived list.
+    /// Store hydration is authoritative for this value.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub archived: bool,
     /// Whether this is a group chat
     pub is_group: bool,
     /// Whether this is the status broadcast.
@@ -137,8 +156,8 @@ pub struct Chat {
     /// chats (incoming message before its store row commits — e.g. the
     /// initial-pairing window) stay `false` until a history load adopts them,
     /// so a complete-but-still-empty store load must not prune them; a chat
-    /// the store DID originate and no longer returns was deleted/archived
-    /// elsewhere and must go.
+    /// the store DID originate and no longer returns from the relevant list
+    /// may be pruned by the front end.
     pub(crate) from_store: bool,
 }
 
@@ -192,6 +211,8 @@ impl Chat {
             unread_count: 0,
             manually_unread: false,
             pinned_at: None,
+            muted_until: None,
+            archived: false,
             is_group,
             is_status,
             avatar_picture_id: None,

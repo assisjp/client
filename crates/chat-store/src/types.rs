@@ -235,6 +235,20 @@ pub struct ChatEntry {
     pub ephemeral_expiration: Option<u32>,
 }
 
+/// The durable chat metadata a live message needs before it can alert.
+///
+/// `allowed` is conservative across an unmerged PN/LID pair: either side's
+/// active mute or archive suppresses the notification. `name` is the best
+/// stored candidate, not necessarily a displayable name; the session's name
+/// resolver still decides whether it is a real subject or a placeholder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatNotificationMetadata {
+    pub muted: bool,
+    pub archived: bool,
+    pub allowed: bool,
+    pub name: Option<String>,
+}
+
 /// A stored message. `message` is the decoded proto when the row has one and
 /// it decodes cleanly; the denormalized columns (`kind`, `text`) always work
 /// even when it doesn't.

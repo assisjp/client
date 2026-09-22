@@ -28,6 +28,9 @@ pub(super) fn received(chat_jid: &str, message: ChatMessage, sender_name: Option
         chat_jid: chat_jid.into(),
         message: Box::new(message),
         sender_name: sender_name.map(str::to_string),
+        notification_allowed: false,
+        notification_title: None,
+        notification_archived: None,
     }
 }
 
@@ -250,6 +253,29 @@ fn a_complete_reload_still_prunes_what_the_store_dropped() {
     assert!(
         bridge.hub.chat("1@s.whatsapp.net").is_none(),
         "deleted elsewhere, so it must leave here too"
+    );
+}
+
+#[test]
+fn an_inactive_chat_does_not_retain_a_live_read_boundary() {
+    let jid = "2@s.whatsapp.net";
+    let mut bridge = bridge();
+    bridge.observe(loaded(vec![stored_chat(
+        jid,
+        1,
+        vec![message("stored", jid, 10, false, false)],
+    )]));
+    assert!(bridge.reads().boundary(jid).is_some());
+
+    bridge.observe(loaded(Vec::new()));
+    assert!(bridge.hub.chat_is_inactive(jid));
+    assert!(bridge.reads().boundary(jid).is_none());
+
+    bridge.observe(received(jid, message("late", jid, 11, false, false), None));
+    assert!(bridge.hub.chat(jid).is_none());
+    assert!(
+        bridge.reads().boundary(jid).is_none(),
+        "the suppressed live event was observed before translation"
     );
 }
 

@@ -26,6 +26,7 @@
 //! expression and the `#[cfg]` is on the two blocks themselves. A module to
 //! hold one line is ceremony; the rule starts where there is a body to name.
 
+mod activity;
 mod capabilities;
 pub mod clipboard;
 pub mod clock;
@@ -37,16 +38,21 @@ pub mod keyboard;
 pub mod launch;
 pub mod lifecycle;
 pub mod log_store;
+mod notifications;
 pub mod picker;
 pub mod plugins;
 pub mod prefs;
 pub mod startup;
 
+pub use activity::application_is_active;
 pub use capabilities::{calls_belong_to_another_tab, calls_unavailable, video_decode_unavailable};
 pub use clock::{sleep, with_timeout};
 pub use fonts::{fonts, with_downloaded_fonts};
 pub use identity::front_end_id;
 pub use launch::run;
 pub use lifecycle::{leave, watch_for_departure};
+pub use notifications::{
+    request_authorization as request_notification_authorization, show_notification_with_avatar,
+};
 pub use plugins::Home as PluginHome;
 pub use startup::{application, clocks, logging};

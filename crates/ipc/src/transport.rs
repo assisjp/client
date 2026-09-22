@@ -5,6 +5,11 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 34: `LoadChats.archived` lets the desktop request the store's
+/// include-archived view, and full `Chat` frames carry the durable archive
+/// state used to separate that view. A v33 daemon would ignore the request
+/// field and silently return only active chats, so the mismatch is refused.
+///
 /// 33: `DaemonMessage::AvatarFailed` and `UiEvent::AvatarFailed`. Propagates avatar
 /// resolution, download, and materialization failures with a retryable flag to
 /// coordinate front-end failure cooldowns and retry pacing. A v32 front-end
@@ -252,7 +257,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 33;
+pub const PROTOCOL_VERSION: u32 = 34;
 
 /// Where the daemon's web bridge listens when nobody says otherwise.
 ///

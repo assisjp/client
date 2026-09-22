@@ -168,6 +168,28 @@ impl WhatsAppApp {
         Some(QuotedMessage::from(draft))
     }
 
+    pub(crate) fn cancel_paste_preview(&mut self, cx: &mut Context<Self>) -> bool {
+        let cancelled = self.paste_preview.take().is_some();
+        if cancelled {
+            cx.notify();
+        }
+        cancelled
+    }
+
+    pub(crate) fn confirm_paste_preview(&mut self, cx: &mut Context<Self>) {
+        let Some(preview) = self.paste_preview.take() else {
+            return;
+        };
+        let quoted = self.take_reply_draft(preview.reply, cx);
+        let drawn = self.send_attachment(&preview.jid, preview.file, quoted, cx);
+        let destination_still_open = self.destination == Destination::Chats
+            && self.selected_chat.as_deref() == Some(preview.jid.as_str());
+        if drawn && preview.chat_was_visible && destination_still_open {
+            self.scroll_to_last_message();
+        }
+        cx.notify();
+    }
+
     /// Hand one file to the session and draw its bubble.
     ///
     /// Answers whether a bubble was added, which is what decides if the
@@ -179,6 +201,9 @@ impl WhatsAppApp {
         quoted: Option<QuotedMessage>,
         cx: &mut Context<Self>,
     ) -> bool {
+        #[cfg(test)]
+        self.attachment_attempts.push(file.clone());
+
         let Some(client) = &self.client else {
             warn!("Cannot send a file: client is unavailable");
             self.notify_user(

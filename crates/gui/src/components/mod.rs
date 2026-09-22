@@ -15,6 +15,7 @@ mod message_list;
 mod nav_rail;
 pub mod notice;
 pub mod parts;
+mod paste_preview;
 pub mod plugin_ui;
 mod rich_text;
 mod status;
@@ -33,6 +34,7 @@ pub use media_viewer::{ViewerProps, render_media_viewer};
 pub use message_bubble::render_message_bubble;
 pub use message_list::{new_timeline_state, render_message_list};
 pub use nav_rail::render_nav_rail;
+pub use paste_preview::render_paste_preview;
 pub use plugin_ui::PluginContext;
 pub use rich_text::{BubbleText, render_rich_text};
 pub use status::{

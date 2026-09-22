@@ -161,6 +161,9 @@ fn message(chat: &str, text: &str) -> UiEvent {
         chat_jid: chat.into(),
         message: Box::new(message),
         sender_name: None,
+        notification_allowed: false,
+        notification_title: None,
+        notification_archived: None,
     }
 }
 
@@ -1813,6 +1816,18 @@ fn every_converted_event_is_one_the_filter_admits() {
             "the filter and the conversion disagree about {case:?}"
         );
     }
+}
+
+#[test]
+fn a_server_ack_is_not_reported_to_plugins_as_peer_delivery() {
+    let sent = UiEvent::ReceiptReceived {
+        chat_jid: "a@s.whatsapp.net".into(),
+        message_ids: vec!["MSG-SENT".into()],
+        receipt_type: oxidezap_core::ReceiptType::Sent,
+    };
+
+    assert_eq!(crate::event::kind_of(&sent), None);
+    assert_eq!(crate::event::from_session(&sent), None);
 }
 
 /// A call the peer accepted is a call that was answered. Without it a plugin

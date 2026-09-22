@@ -95,6 +95,20 @@ impl WhatsAppApp {
                     // a conversation that believes it has everything asks for
                     // nothing. See `forget_chat_paging`.
                     self.forget_chat_paging(&dropped, cx);
+                    // An archived scan may have deferred a deleted row that
+                    // is still on screen. This active-only complete load says
+                    // nothing about archived rows, so keep that debt until
+                    // the conversation stops being visible.
+                    departed.extend(
+                        self.departed_chats
+                            .iter()
+                            .filter(|jid| {
+                                self.chats
+                                    .iter()
+                                    .any(|chat| chat.jid.as_str() == jid.as_str() && chat.archived)
+                            })
+                            .cloned(),
+                    );
                     self.departed_chats = departed;
                 }
                 // The updates this load itself brought back already read:
@@ -233,8 +247,21 @@ impl WhatsAppApp {
                 chat_jid,
                 message,
                 sender_name,
+                notification_allowed,
+                notification_title,
+                notification_archived,
             } => {
-                self.handle_message_received(chat_jid, *message, sender_name, cx);
+                self.handle_message_received(
+                    chat_jid,
+                    *message,
+                    sender_name,
+                    IncomingAlert::new(
+                        notification_allowed,
+                        notification_title,
+                        notification_archived,
+                    ),
+                    cx,
+                );
                 // A live status update brings its own 24-hour deadline with
                 // it, and it can be the earliest one on screen.
                 self.ensure_status_tick(cx);

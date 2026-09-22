@@ -153,11 +153,11 @@ pub fn render_hover_actions(
             ),
         )
         .child(
-            action(ids.reply.clone(), ProductIcon::Reply.into(), "Reply").on_click(
-                move |_, window, cx| {
+            action(ids.reply.clone(), ProductIcon::Reply.into(), "Reply")
+                .cursor_pointer()
+                .on_click(move |_, window, cx| {
                     reply_entity.update(cx, |app, cx| app.begin_reply(&reply_id, window, cx));
-                },
-            ),
+                }),
         )
         .when(has_text, |el| {
             el.child(gpui_component::clipboard::Clipboard::new(ids.copy.clone()).value(content))

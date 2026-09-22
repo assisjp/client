@@ -9,7 +9,7 @@ use std::sync::Arc;
 use gpui::StyledImage as _;
 use gpui::{
     App, Entity, Image, ImageSource, InteractiveElement, IntoElement, ParentElement, RenderImage,
-    SharedString, StatefulInteractiveElement, Styled, div, img,
+    SharedString, StatefulInteractiveElement, Styled, div, img, prelude::FluentBuilder as _,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -146,6 +146,7 @@ pub fn render_media_viewer(
                         .flex()
                         .items_center()
                         .justify_center()
+                        .cursor_pointer()
                         .on_click(move |_, _window, cx| {
                             scrim_entity.update(cx, |app, cx| {
                                 app.close_media_viewer(cx);
@@ -272,6 +273,7 @@ fn render_bar(
                 } else {
                     "Nothing to save: this file could not be read"
                 })
+                .when(can_save, |button| button.cursor_pointer())
                 .on_click(move |_, _window, cx| {
                     save_entity.update(cx, |app, cx| app.save_media(&message_id, cx));
                 }),
@@ -281,6 +283,7 @@ fn render_bar(
                 .icon(Icon::new(IconName::Close))
                 .ghost()
                 .tooltip("Close")
+                .cursor_pointer()
                 .on_click(move |_, _window, cx| {
                     close_entity.update(cx, |app, cx| {
                         app.close_media_viewer(cx);
@@ -357,5 +360,6 @@ fn step_button<F: Fn(&mut App) + 'static>(
         .large()
         .tooltip(tooltip)
         .disabled(!enabled)
+        .when(enabled, |button| button.cursor_pointer())
         .on_click(move |_, _window, cx| on_click(cx))
 }

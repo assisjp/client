@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use gpui::{
     App, Entity, FocusHandle, Image, ImageSource, InteractiveElement as _, IntoElement, ObjectFit,
-    ParentElement as _, Styled as _, StyledImage as _, div, img,
+    ParentElement as _, Styled as _, StyledImage as _, div, img, prelude::FluentBuilder as _,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{Disableable as _, FocusTrapElement as _};
@@ -69,6 +69,7 @@ pub fn render_paste_preview(
                         .child(
                             Button::new("paste-preview-cancel-button")
                                 .label("Cancel")
+                                .cursor_pointer()
                                 .on_click({
                                     let app = app.clone();
                                     move |_event, _window, cx| {
@@ -88,6 +89,7 @@ pub fn render_paste_preview(
                                 .label("Send")
                                 .primary()
                                 .disabled(!can_send)
+                                .when(can_send, |button| button.cursor_pointer())
                                 .on_click(move |_event, _window, cx| {
                                     app.update(cx, |app, cx| app.confirm_paste_preview(cx));
                                 }),

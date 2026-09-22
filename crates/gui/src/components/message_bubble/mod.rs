@@ -322,6 +322,7 @@ pub fn render_message_bubble(
                                 .ghost()
                                 .xsmall()
                                 .tooltip(format!("Open {target}"))
+                                .cursor_pointer()
                                 .on_click(move |_, _, cx| {
                                     cx.open_url(&url);
                                 })
@@ -340,6 +341,7 @@ pub fn render_message_bubble(
                                 .danger()
                                 .xsmall()
                                 .tooltip("Send this message again")
+                                .cursor_pointer()
                                 .on_click(move |_, window, cx| {
                                     retry_entity.update(cx, |app, cx| {
                                         app.retry_send(&retry_id, window, cx)

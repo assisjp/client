@@ -82,6 +82,7 @@ fn open_the_window() {
                 let view = cx.new(WhatsAppApp::new);
                 let notification_view = view.downgrade();
                 let notification_window = window.window_handle();
+                let app_notification_window = notification_window;
                 cx.on_system_notification_response(move |response, cx| {
                     let tag = response.tag.to_string();
                     cx.dismiss_system_notification(&tag);
@@ -111,6 +112,7 @@ fn open_the_window() {
                 // and edits to an existing `theme.json` did nothing until
                 // the next restart.
                 view.update(cx, |app, cx| {
+                    app.set_notification_window(app_notification_window);
                     app.watch_theme_file(cx);
                     // After the window exists, so the ten seconds a cold
                     // start can spend waiting for a daemon to come up are

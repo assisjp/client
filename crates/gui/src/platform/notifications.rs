@@ -35,11 +35,11 @@ pub fn show_notification_with_avatar(
 
 #[cfg(target_os = "macos")]
 mod imp {
-    use std::collections::hash_map::DefaultHasher;
+    use std::collections::{HashMap, hash_map::DefaultHasher};
     use std::hash::{Hash, Hasher};
     use std::path::{Path, PathBuf};
     use std::ptr::NonNull;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, OnceLock};
 
     use block2::RcBlock;
     use objc2::rc::autoreleasepool;
@@ -48,8 +48,46 @@ mod imp {
     use objc2_user_notifications::{
         UNAuthorizationOptions, UNAuthorizationStatus, UNMutableNotificationContent,
         UNNotificationAttachment, UNNotificationRequest, UNNotificationSettings,
-        UNUserNotificationCenter,
+        UNNotificationSound, UNUserNotificationCenter,
     };
+    use portable_atomic::{AtomicU64, Ordering};
+
+    /// One submission lane per stable notification tag. Avatar reads happen
+    /// on workers, so an older read can otherwise finish after a newer one
+    /// and replace the newer banner. The generation check also covers a
+    /// failed attachment's plain retry, which is delivered asynchronously.
+    struct TagState {
+        generation: u64,
+        lane: Arc<Mutex<()>>,
+    }
+
+    static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+    static TAG_STATES: OnceLock<Mutex<HashMap<String, TagState>>> = OnceLock::new();
+
+    fn begin_tag_submission(tag: &str) -> (u64, Arc<Mutex<()>>) {
+        let states = TAG_STATES.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut states = states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = states.entry(tag.to_string()).or_insert_with(|| TagState {
+            generation: 0,
+            lane: Arc::new(Mutex::new(())),
+        });
+        state.generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
+        (state.generation, Arc::clone(&state.lane))
+    }
+
+    fn is_current_tag_submission(tag: &str, generation: u64) -> bool {
+        TAG_STATES
+            .get()
+            .and_then(|states| states.lock().ok())
+            .and_then(|states| states.get(tag).map(|state| state.generation == generation))
+            .unwrap_or(false)
+    }
+
+    fn may_retry_plain(tag: &str, generation: u64, has_attachment: bool) -> bool {
+        has_attachment && is_current_tag_submission(tag, generation)
+    }
 
     pub(super) fn request_authorization() {
         // The API raises an Objective-C exception outside an application
@@ -98,6 +136,7 @@ mod imp {
         let title = title.to_string();
         let body = body.to_string();
         let avatar = Arc::new(avatar);
+        let (generation, lane) = begin_tag_submission(&tag);
         let settings = RcBlock::new(move |settings: NonNull<UNNotificationSettings>| {
             // SAFETY: UserNotifications lends a live settings object for this callback.
             let status = unsafe { settings.as_ref() }.authorizationStatus();
@@ -115,10 +154,18 @@ mod imp {
                 body.clone(),
                 Arc::clone(&avatar),
             );
+            let lane = Arc::clone(&lane);
             std::thread::spawn(move || {
                 let bytes = avatar();
                 autoreleasepool(|_| {
-                    post_authorized(&tag, &title, &body, bytes.as_deref().map(Vec::as_slice));
+                    post_authorized(
+                        &tag,
+                        &title,
+                        &body,
+                        bytes.as_deref().map(Vec::as_slice),
+                        generation,
+                        lane,
+                    );
                 });
             });
         });
@@ -127,15 +174,30 @@ mod imp {
         true
     }
 
-    fn post_authorized(tag: &str, title: &str, body: &str, avatar: Option<&[u8]>) {
+    fn post_authorized(
+        tag: &str,
+        title: &str,
+        body: &str,
+        avatar: Option<&[u8]>,
+        generation: u64,
+        lane: Arc<Mutex<()>>,
+    ) {
+        let _submission = lane.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let content = UNMutableNotificationContent::new();
         content.setTitle(&NSString::from_str(title));
         content.setBody(&NSString::from_str(body));
 
         let attachment = avatar.and_then(|bytes| make_avatar_attachment(tag, bytes));
+        if !is_current_tag_submission(tag, generation) {
+            if let Some((_, path)) = attachment {
+                let _ = std::fs::remove_file(path);
+            }
+            return;
+        }
         if let Some((image, _)) = &attachment {
             content.setAttachments(&NSArray::from_retained_slice(std::slice::from_ref(image)));
         }
+        content.setSound(Some(&UNNotificationSound::defaultSound()));
 
         // A nil trigger delivers immediately. The stable tag has the same
         // replacement semantics as GPUI's notification backend.
@@ -149,6 +211,7 @@ mod imp {
         let retry_tag = tag.to_string();
         let retry_title = title.to_string();
         let retry_body = body.to_string();
+        let retry_lane = Arc::clone(&lane);
         let completion = RcBlock::new(move |error: *mut NSError| {
             // SAFETY: when non-null, UserNotifications lends an NSError for
             // the duration of this callback.
@@ -164,7 +227,24 @@ mod imp {
                 // alert. Re-submit once without media; the same request id
                 // replaces any pending first attempt, without a second loop.
                 if retry_without_avatar {
-                    submit_plain(&retry_tag, &retry_title, &retry_body);
+                    // Queue the retry off the callback. Although Apple's
+                    // implementation calls this asynchronously, keeping the
+                    // retry off-stack also makes the per-tag lane safe if a
+                    // test double or a future implementation invokes the
+                    // completion inline while `post_authorized` still owns
+                    // the lane lock.
+                    let retry_lane = Arc::clone(&retry_lane);
+                    let retry_tag = retry_tag.clone();
+                    let retry_title = retry_title.clone();
+                    let retry_body = retry_body.clone();
+                    std::thread::spawn(move || {
+                        let _submission = retry_lane
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if may_retry_plain(&retry_tag, generation, retry_without_avatar) {
+                            submit_plain(&retry_tag, &retry_title, &retry_body);
+                        }
+                    });
                 }
             }
         });
@@ -176,6 +256,7 @@ mod imp {
         let content = UNMutableNotificationContent::new();
         content.setTitle(&NSString::from_str(title));
         content.setBody(&NSString::from_str(body));
+        content.setSound(Some(&UNNotificationSound::defaultSound()));
         let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
             &NSString::from_str(tag),
             &content,
@@ -265,6 +346,53 @@ mod imp {
             Some("gif")
         } else {
             None
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_new_generation_invalidates_only_the_same_tag() {
+            let (old, old_lane) = begin_tag_submission("test-notification-stale");
+            let (current, current_lane) = begin_tag_submission("test-notification-stale");
+
+            assert_ne!(old, current);
+            assert!(!is_current_tag_submission("test-notification-stale", old));
+            assert!(is_current_tag_submission(
+                "test-notification-stale",
+                current
+            ));
+            assert!(Arc::ptr_eq(&old_lane, &current_lane));
+            assert!(may_retry_plain("test-notification-stale", current, true));
+            assert!(!may_retry_plain("test-notification-stale", old, true));
+            assert!(!may_retry_plain("test-notification-stale", current, false));
+        }
+
+        #[test]
+        fn independent_tags_keep_independent_generations_and_lanes() {
+            let (first, first_lane) = begin_tag_submission("test-notification-first");
+            let (second, second_lane) = begin_tag_submission("test-notification-second");
+
+            assert!(is_current_tag_submission("test-notification-first", first));
+            assert!(is_current_tag_submission(
+                "test-notification-second",
+                second
+            ));
+            assert!(!Arc::ptr_eq(&first_lane, &second_lane));
+
+            let (next_first, next_first_lane) = begin_tag_submission("test-notification-first");
+            assert!(!is_current_tag_submission("test-notification-first", first));
+            assert!(is_current_tag_submission(
+                "test-notification-first",
+                next_first
+            ));
+            assert!(is_current_tag_submission(
+                "test-notification-second",
+                second
+            ));
+            assert!(Arc::ptr_eq(&first_lane, &next_first_lane));
         }
     }
 }

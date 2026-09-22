@@ -130,7 +130,11 @@ fn apply_history_conversation(
                     "CASE WHEN mute_appstate_seen THEN muted_until ELSE excluded.muted_until END",
                 )),
                 dsl::archived.eq(diesel::dsl::sql::<diesel::sql_types::Bool>(
-                    "CASE WHEN archive_appstate_seen THEN archived ELSE excluded.archived END",
+                    if conv.archived.is_some() {
+                        "CASE WHEN archive_appstate_seen THEN archived ELSE excluded.archived END"
+                    } else {
+                        "archived"
+                    },
                 )),
             ))
             .execute(conn)?;

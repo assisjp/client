@@ -106,6 +106,76 @@ async fn history_prefills_live_row_without_overwriting_appstate() {
 }
 
 #[tokio::test]
+async fn missing_preference_options_do_not_unmute_or_unarchive() {
+    let (_store, chat_store) = test_store().await;
+    let snapshot = |archived: Option<bool>| {
+        history_sync_event(wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::RECENT,
+            conversations: vec![wa::Conversation {
+                id: PEER.into(),
+                conversation_timestamp: Some(1_700_000_000),
+                mute_end_time: Some(1_900_000_000),
+                archived,
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+    };
+    feed(&chat_store, [snapshot(Some(true))]).await;
+    feed(
+        &chat_store,
+        [
+            Event::MuteUpdate(
+                wacore::types::events::MuteUpdate::builder()
+                    .jid(jid(PEER))
+                    .timestamp(ts(1_700_000_100))
+                    .action(Box::new(wa::sync_action_value::MuteAction::default()))
+                    .from_full_sync(false)
+                    .build(),
+            ),
+            Event::ArchiveUpdate(
+                wacore::types::events::ArchiveUpdate::builder()
+                    .jid(jid(PEER))
+                    .timestamp(ts(1_700_000_100))
+                    .action(Box::new(wa::sync_action_value::ArchiveChatAction::default()))
+                    .from_full_sync(false)
+                    .build(),
+            ),
+        ],
+    )
+    .await;
+    let state = chat_store
+        .notification_metadata(&jid(PEER))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(state.muted);
+    assert!(state.archived);
+
+    feed(&chat_store, [snapshot(None)]).await;
+    assert!(
+        chat_store
+            .notification_metadata(&jid(PEER))
+            .await
+            .unwrap()
+            .unwrap()
+            .archived
+    );
+
+    // An explicit false from history still applies: the missing actions
+    // above must not have marked either preference app-state authoritative.
+    feed(&chat_store, [snapshot(Some(false))]).await;
+    assert!(
+        !chat_store
+            .notification_metadata(&jid(PEER))
+            .await
+            .unwrap()
+            .unwrap()
+            .archived
+    );
+}
+
+#[tokio::test]
 async fn history_sync_materializes_without_clobbering_live_rows() {
     let (_store, chat_store) = test_store().await;
     let chat = jid(PEER);

@@ -1822,6 +1822,55 @@ async fn a_scoped_load_skips_an_archived_chat() {
     assert!(restored.archived, "archive state survives hydration");
 }
 
+#[tokio::test]
+async fn alias_hydration_is_archived_only_when_both_rows_are_archived() {
+    let (chat_store, client) = test_session("archive-aliases").await;
+    let pn = "559900000008@s.whatsapp.net";
+    let lid = "111000011118888@lid";
+    client
+        .add_lid_pn_mapping(
+            "111000011118888",
+            "559900000008",
+            whatsapp_rust::lid_pn_cache::LearningSource::Usync,
+        )
+        .await
+        .expect("synthetic alias mapping");
+
+    let entry = |jid: &str, archived: bool| ChatEntry {
+        jid: jid.parse().expect("test JID"),
+        name: None,
+        last_message_at: None,
+        last_message_preview: None,
+        last_message_kind: None,
+        unread_count: 0,
+        pinned_at: None,
+        muted_until: None,
+        archived,
+        ephemeral_expiration: None,
+    };
+    for (first, second, expected) in [
+        (true, false, false),
+        (false, true, false),
+        (true, true, true),
+    ] {
+        let chats = WhatsAppClient::hydrate_entries(
+            &chat_store,
+            &client,
+            &book(),
+            vec![entry(pn, first), entry(lid, second)],
+            |_| 0,
+        )
+        .await
+        .expect("alias rows hydrate");
+        assert_eq!(chats.len(), 1, "PN/LID must merge");
+        assert_eq!(chats[0].jid, lid);
+        assert_eq!(
+            chats[0].archived, expected,
+            "first={first}, second={second}"
+        );
+    }
+}
+
 /// A cursor is this crate's to write and to read, and the only thing that
 /// makes that safe is that the two agree.
 #[test]

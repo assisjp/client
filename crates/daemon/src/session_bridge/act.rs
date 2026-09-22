@@ -284,14 +284,16 @@ impl Bridge {
                                 // rows here would resurrect them as ordinary
                                 // placeholder chats on the next attach.
                                 if chat.archived {
-                                    if !hub.apply_for(
+                                    hub.apply_for(
                                         asked_as,
                                         Change::from_store(DaemonEvent::ChatRemoved {
                                             jid: chat.jid.clone(),
                                         }),
-                                    ) {
-                                        reads.forget(&chat.jid);
-                                    }
+                                    );
+                                    // An archived row has no active read
+                                    // boundary, even if this generation's
+                                    // removal was accepted by the hub.
+                                    reads.forget(&chat.jid);
                                     continue;
                                 }
                                 // Asked and written under one lock, so a

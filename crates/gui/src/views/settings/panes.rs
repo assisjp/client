@@ -405,9 +405,10 @@ fn notifications(metrics: Metrics, cx: &App) -> AnyElement {
     group(
         label("NOTIFICATIONS", metrics, cx),
         pending(
-            "Incoming messages raise desktop notifications while this window is running, \
-             except for the conversation currently visible in the active window. Clicking a \
-             notification opens that conversation.",
+            "When system permissions allow, eligible incoming messages may raise desktop \
+             notifications while this window is running. Muted, archived, policy-blocked, \
+             self-sent, and currently visible messages are suppressed; an explicit group \
+             mention may still alert. Clicking a notification opens that conversation.",
             metrics,
             cx,
         ),

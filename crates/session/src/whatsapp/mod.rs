@@ -2154,7 +2154,15 @@ impl WhatsAppClient {
             if let Some(store) = names.chat_store() {
                 match store.notification_metadata(&info.source.chat).await {
                     Ok(Some(metadata)) => {
-                        let allowed = metadata.allowed || mentions_me;
+                        // The wire flag is the notification invariant, not a
+                        // copy of the chat policy: self echoes are displayed
+                        // as outgoing bubbles and must never ask a front end
+                        // to alert, even when their chat is otherwise eligible.
+                        let allowed = allows_desktop_notification(
+                            info.source.is_from_me,
+                            metadata.allowed,
+                            mentions_me,
+                        );
                         let title = if allowed {
                             let identity = names.identity(client, &info.source.chat).await;
                             let (title, priority) = names
@@ -2862,6 +2870,12 @@ impl WhatsAppClient {
     }
 }
 
+/// Keep the notification bit's wire invariant in one place: outgoing echoes
+/// never alert, while an explicit mention may bypass the durable chat policy.
+fn allows_desktop_notification(is_from_me: bool, policy_allowed: bool, mentions_me: bool) -> bool {
+    !is_from_me && (policy_allowed || mentions_me)
+}
+
 /// Tell the UI which real id a just-sent optimistic bubble got.
 fn notify_message_id(
     ui_sender: &UiEventSender,
@@ -2959,4 +2973,18 @@ fn because(error: &dyn std::error::Error) -> String {
         source = cause.source();
     }
     text
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod notification_policy_tests {
+    use super::allows_desktop_notification;
+
+    #[test]
+    fn self_echoes_never_cross_the_notification_wire() {
+        assert!(!allows_desktop_notification(true, true, false));
+        assert!(!allows_desktop_notification(true, false, true));
+        assert!(allows_desktop_notification(false, true, false));
+        assert!(allows_desktop_notification(false, false, true));
+        assert!(!allows_desktop_notification(false, false, false));
+    }
 }

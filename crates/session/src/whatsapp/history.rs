@@ -605,10 +605,9 @@ impl WhatsAppClient {
                 if entry.muted_until > existing.muted_until {
                     existing.muted_until = entry.muted_until;
                 }
-                // `entries` are in display order; the first alias is the
-                // row this logical thread is represented by. A stale second
-                // PN/LID row must not make an unarchived primary row archived
-                // again merely because aliases are being collapsed.
+                // An active alias keeps the logical conversation active,
+                // regardless of which PN/LID row leads display order.
+                existing.archived &= entry.archived;
                 existing.set_name_if_better(name, name_priority);
                 continue;
             }

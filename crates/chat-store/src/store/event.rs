@@ -168,7 +168,11 @@ pub(super) fn apply_event(
             Ok(())
         }
         Event::MuteUpdate(update) => {
-            let muted_until = if update.action.muted.unwrap_or(false) {
+            let Some(muted) = update.action.muted else {
+                // Missing is not an explicit unmute or app-state authority.
+                return Ok(());
+            };
+            let muted_until = if muted {
                 // Absent or non-positive (WA Web sends -1 for indefinite,
                 // this crate's own mute_chat() included) = muted forever.
                 Some(
@@ -202,9 +206,12 @@ pub(super) fn apply_event(
             Ok(())
         }
         Event::ArchiveUpdate(update) => {
+            let Some(archived) = update.action.archived else {
+                // Missing is not an explicit unarchive.
+                return Ok(());
+            };
             let chat = crate::lid::route_chat_key(conn, device_id, &update.jid.to_string(), cs)?;
             ensure_chat(conn, device_id, &chat)?;
-            let archived = update.action.archived.unwrap_or(false);
             let (stored, seen): (bool, bool) = chat_row(device_id, &chat)
                 .select((
                     schema::chats::archived,

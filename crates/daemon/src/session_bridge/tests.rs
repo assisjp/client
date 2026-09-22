@@ -256,6 +256,29 @@ fn a_complete_reload_still_prunes_what_the_store_dropped() {
     );
 }
 
+#[test]
+fn an_inactive_chat_does_not_retain_a_live_read_boundary() {
+    let jid = "2@s.whatsapp.net";
+    let mut bridge = bridge();
+    bridge.observe(loaded(vec![stored_chat(
+        jid,
+        1,
+        vec![message("stored", jid, 10, false, false)],
+    )]));
+    assert!(bridge.reads().boundary(jid).is_some());
+
+    bridge.observe(loaded(Vec::new()));
+    assert!(bridge.hub.chat_is_inactive(jid));
+    assert!(bridge.reads().boundary(jid).is_none());
+
+    bridge.observe(received(jid, message("late", jid, 11, false, false), None));
+    assert!(bridge.hub.chat(jid).is_none());
+    assert!(
+        bridge.reads().boundary(jid).is_none(),
+        "the suppressed live event was observed before translation"
+    );
+}
+
 /// A pairing code expires. A client that is handed the state late must be
 /// able to tell, which a relative "expires in N" replayed in a snapshot
 /// cannot express.

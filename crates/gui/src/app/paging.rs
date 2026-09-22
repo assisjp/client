@@ -10,7 +10,7 @@
 //! What a cursor *is* stays the daemon's business. This side holds the last
 //! one it was given and hands it back.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use gpui::{App, Context};
 use log::debug;
@@ -45,6 +45,38 @@ pub(super) enum Paging {
     /// still committing batches, and asking again from there is asking for
     /// exactly what was not there the first time.
     Done { from: Option<PageCursor> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatPageArrival {
+    Ignored,
+    Applied,
+    Restarted,
+}
+
+/// Requests needed to hydrate both chat lists for an unresolved notification.
+///
+/// A click can race the initial active snapshot, while the target itself may
+/// live only in the include-archived list. Neither list being done proves the
+/// tag is absent from the other one, so the caller keeps the response pending
+/// until both have reached their terminal state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct NotificationPagePlan {
+    /// A request for the active list, if it was not already in flight/done.
+    /// The inner `None` asks from the top; `Some(cursor)` continues a page.
+    pub(super) active: Option<Option<PageCursor>>,
+    /// The equivalent request for the include-archived list.
+    pub(super) archived: Option<Option<PageCursor>>,
+    /// True once the active list's complete hydration has arrived.
+    pub(super) active_done: bool,
+    /// True once the archived list's complete hydration has arrived.
+    pub(super) archived_done: bool,
+}
+
+impl NotificationPagePlan {
+    pub(super) fn done(&self) -> bool {
+        self.active_done && self.archived_done
+    }
 }
 
 impl Paging {
@@ -109,6 +141,9 @@ pub(super) struct Pages {
     chats: Paging,
     /// The include-archived list has a different ordering window and cursor.
     archived_chats: Paging,
+    /// A history change while an archived page is in flight invalidates its
+    /// ordering. Let the response settle, then start a fresh scan at the top.
+    restart_archived_after_load: bool,
 }
 
 impl Pages {
@@ -117,6 +152,7 @@ impl Pages {
             timelines: TimelinePages::new(),
             chats: Paging::default(),
             archived_chats: Paging::default(),
+            restart_archived_after_load: false,
         }
     }
 
@@ -166,6 +202,20 @@ impl Pages {
         Some(ask)
     }
 
+    /// Advance both chat lists for a notification response. This is
+    /// deliberately separate from the rendered filter: a click is an
+    /// explicit request for one chat, even while the active list is shown.
+    fn notification_page_plan(&mut self) -> NotificationPagePlan {
+        let active = self.more_chats(false);
+        let archived = self.more_chats(true);
+        NotificationPagePlan {
+            active,
+            archived,
+            active_done: matches!(self.chats, Paging::Done { .. }),
+            archived_done: matches!(self.archived_chats, Paging::Done { .. }),
+        }
+    }
+
     /// Settle a conversation's position on the page that arrived, saying
     /// whether anything was waiting for it.
     ///
@@ -184,26 +234,37 @@ impl Pages {
     }
 
     /// The same, for the chat list.
-    fn chat_page_arrived(&mut self, archived: bool, next: Option<PageCursor>) -> bool {
-        let list = self.chat_list(archived);
-        let Paging::Loading { from } = list else {
-            return false;
+    fn chat_page_arrived(&mut self, archived: bool, next: Option<PageCursor>) -> ChatPageArrival {
+        let Paging::Loading { from } = self.chat_list(archived) else {
+            return ChatPageArrival::Ignored;
         };
-        *list = Paging::arrived(from.clone(), next);
-        true
+        let asked_from = from.clone();
+        if archived && std::mem::take(&mut self.restart_archived_after_load) {
+            self.archived_chats = Paging::Unasked;
+            return ChatPageArrival::Restarted;
+        }
+        *self.chat_list(archived) = Paging::arrived(asked_from, next);
+        ChatPageArrival::Applied
     }
 
     /// A page that was refused. Put the position back so it can be asked for
     /// again; a list that stayed `Loading` would never ask anything again.
-    fn lost(&mut self, jid: Option<&str>, archived: bool) {
+    /// Return whether a history-triggered archived restart is ready to ask.
+    fn lost(&mut self, jid: Option<&str>, archived: bool) -> bool {
         match jid {
             Some(jid) => {
                 let paging = self.timelines.entry(jid.to_string()).or_default();
                 *paging = paging.lost();
+                false
             }
             None => {
+                if archived && std::mem::take(&mut self.restart_archived_after_load) {
+                    self.archived_chats = Paging::Unasked;
+                    return true;
+                }
                 let list = self.chat_list(archived);
                 *list = list.lost();
+                false
             }
         }
     }
@@ -232,7 +293,9 @@ impl Pages {
         // in-flight answer has settled; a request already on the wire keeps
         // its position so an older response cannot be mistaken for a newer
         // one.
-        if !matches!(self.archived_chats, Paging::Loading { .. }) {
+        if matches!(self.archived_chats, Paging::Loading { .. }) {
+            self.restart_archived_after_load = true;
+        } else {
             self.archived_chats = Paging::Unasked;
         }
     }
@@ -242,7 +305,21 @@ impl Pages {
         self.timelines.clear();
         self.chats = Paging::Unasked;
         self.archived_chats = Paging::Unasked;
+        self.restart_archived_after_load = false;
     }
+}
+
+/// Keep active-list removals from a complete history load, but replace the
+/// archived-list debt with what this completed scan actually deferred. A JID
+/// re-found by the scan no longer owes removal when its view closes.
+fn reconcile_departures(
+    departed: &mut HashSet<String>,
+    active: &HashSet<&str>,
+    seen: &HashSet<String>,
+    archived_deferred: Vec<String>,
+) {
+    departed.retain(|jid| active.contains(jid.as_str()) && !seen.contains(jid));
+    departed.extend(archived_deferred);
 }
 
 impl WhatsAppApp {
@@ -299,6 +376,31 @@ impl WhatsAppApp {
             }
             client.load_chats(ask, archived);
         }
+    }
+
+    /// Ask both chat lists for the next page on behalf of a system
+    /// notification click. Unlike [`Self::want_more_chats`], this does not
+    /// depend on the current sidebar filter or whether either list is visible.
+    pub(super) fn request_notification_pages(
+        &mut self,
+        cx: &mut App,
+    ) -> Option<NotificationPagePlan> {
+        let Some(client) = &self.client else {
+            return None;
+        };
+        let result = self
+            .pages
+            .update(cx, |pages, _| pages.notification_page_plan());
+        if let Some(ask) = &result.active {
+            client.load_chats(ask.clone(), false);
+        }
+        if let Some(ask) = &result.archived {
+            if ask.is_none() {
+                self.archived_scan.clear();
+            }
+            client.load_chats(ask.clone(), true);
+        }
+        Some(result)
     }
 
     /// Fold one page of a conversation into it.
@@ -361,12 +463,21 @@ impl WhatsAppApp {
         let archived_scan_finished = archived && next.is_none();
         // The same rule, and the one that matters most: this page's rows go
         // into the list whether or not anything else remembers them.
-        if !self
+        match self
             .pages
             .update(cx, |pages, _| pages.chat_page_arrived(archived, next))
         {
-            debug!("a chat page arrived that nobody asked for");
-            return;
+            ChatPageArrival::Ignored => {
+                debug!("a chat page arrived that nobody asked for");
+                return;
+            }
+            ChatPageArrival::Restarted => {
+                // This answer was ordered before the history change. The
+                // next request restarts the scan and clears its seen set.
+                cx.notify();
+                return;
+            }
+            ChatPageArrival::Applied => {}
         }
         if chats.is_empty() {
             if archived_scan_finished {
@@ -375,12 +486,11 @@ impl WhatsAppApp {
             return;
         }
         if archived {
-            self.archived_scan.extend(
-                chats
-                    .iter()
-                    .filter(|chat| chat.archived)
-                    .map(|chat| chat.jid.clone()),
-            );
+            // Include-archived pages also carry active rows. Remember all of
+            // them so a re-found JID cancels old deferred removal debt even
+            // if its archive flag changed since the previous scan.
+            self.archived_scan
+                .extend(chats.iter().map(|chat| chat.jid.clone()));
         }
         // The same entrance a history load uses: a page that merely called
         // `merge_chats` left a notice for a group that arrives only by page
@@ -417,7 +527,18 @@ impl WhatsAppApp {
                 }
             });
         }
-        self.departed_chats.extend(deferred);
+        let active = self
+            .chats
+            .iter()
+            .filter(|chat| !chat.archived)
+            .map(|chat| chat.jid.as_str())
+            .collect();
+        reconcile_departures(
+            &mut self.departed_chats,
+            &active,
+            &self.archived_scan,
+            deferred,
+        );
         if dropped.is_empty() {
             return;
         }
@@ -429,9 +550,18 @@ impl WhatsAppApp {
 
     /// A page that was refused. Put the position back so it can be asked for
     /// again; a view that stayed `Loading` would never ask anything again.
-    pub(super) fn page_lost(&mut self, jid: Option<String>, archived: bool, cx: &mut App) {
-        self.pages
-            .update(cx, |pages, _| pages.lost(jid.as_deref(), archived));
+    pub(super) fn page_lost(
+        &mut self,
+        jid: Option<String>,
+        archived: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .pages
+            .update(cx, |pages, _| pages.lost(jid.as_deref(), archived))
+        {
+            cx.notify();
+        }
     }
 
     /// Forget where these conversations continued.
@@ -608,11 +738,97 @@ mod tests {
 
         assert_eq!(pages.more_chats(false), Some(None));
         assert_eq!(pages.more_chats(true), Some(None));
-        assert!(pages.chat_page_arrived(false, Some(cursor("active-next"))));
-        assert!(pages.chat_page_arrived(true, Some(cursor("archive-next"))));
+        assert_eq!(
+            pages.chat_page_arrived(false, Some(cursor("active-next"))),
+            ChatPageArrival::Applied
+        );
+        assert_eq!(
+            pages.chat_page_arrived(true, Some(cursor("archive-next"))),
+            ChatPageArrival::Applied
+        );
 
         assert_eq!(pages.more_chats(false), Some(Some(cursor("active-next"))));
         assert_eq!(pages.more_chats(true), Some(Some(cursor("archive-next"))));
+    }
+
+    #[test]
+    fn a_notification_advances_active_and_archived_pages_without_the_filter() {
+        let mut pages = Pages::new();
+
+        let first = pages.notification_page_plan();
+        assert_eq!(first.active, Some(None));
+        assert_eq!(first.archived, Some(None));
+        assert!(!first.done());
+
+        let in_flight = pages.notification_page_plan();
+        assert_eq!(in_flight.active, None);
+        assert_eq!(in_flight.archived, None);
+        assert!(
+            !in_flight.done(),
+            "a click must not duplicate either request"
+        );
+
+        assert_eq!(
+            pages.chat_page_arrived(true, Some(cursor("archive-next"))),
+            ChatPageArrival::Applied
+        );
+        let archive_next = pages.notification_page_plan();
+        assert_eq!(archive_next.active, None);
+        assert_eq!(archive_next.archived, Some(Some(cursor("archive-next"))));
+        assert!(!archive_next.done());
+
+        assert_eq!(
+            pages.chat_page_arrived(true, None),
+            ChatPageArrival::Applied
+        );
+        let archive_done = pages.notification_page_plan();
+        assert!(archive_done.archived_done);
+        assert!(!archive_done.active_done);
+        assert!(
+            !archive_done.done(),
+            "archived completion does not prove the active list was hydrated"
+        );
+
+        assert_eq!(
+            pages.chat_page_arrived(false, Some(cursor("active-next"))),
+            ChatPageArrival::Applied
+        );
+        let active_next = pages.notification_page_plan();
+        assert_eq!(active_next.active, Some(Some(cursor("active-next"))));
+        assert_eq!(active_next.archived, None);
+        assert!(!active_next.done());
+
+        assert_eq!(
+            pages.chat_page_arrived(false, None),
+            ChatPageArrival::Applied
+        );
+        let both_done = pages.notification_page_plan();
+        assert!(both_done.active_done);
+        assert!(both_done.archived_done);
+        assert!(both_done.done(), "only both complete scans end the retry");
+    }
+
+    #[test]
+    fn a_notification_page_loss_reopens_only_the_failed_chat_list() {
+        let mut pages = Pages::new();
+        let first = pages.notification_page_plan();
+        assert_eq!(first.active, Some(None));
+        assert_eq!(first.archived, Some(None));
+
+        // The archived request failed while the active request is still in
+        // flight. Only the archived cursor is put back, so retrying cannot
+        // duplicate the active request.
+        pages.lost(None, true);
+        let archived_retry = pages.notification_page_plan();
+        assert_eq!(archived_retry.active, None);
+        assert_eq!(archived_retry.archived, Some(None));
+
+        // The active request can fail independently and is then re-asked at
+        // its own position as well.
+        pages.lost(None, false);
+        let active_retry = pages.notification_page_plan();
+        assert_eq!(active_retry.active, Some(None));
+        assert_eq!(active_retry.archived, None);
     }
 
     /// A load walks the store's order itself, so what it says about the end
@@ -861,7 +1077,10 @@ mod tests {
         pages.forget();
 
         assert!(!pages.timeline_page_arrived(CHAT, None));
-        assert!(!pages.chat_page_arrived(false, None));
+        assert_eq!(
+            pages.chat_page_arrived(false, None),
+            ChatPageArrival::Ignored
+        );
     }
 
     /// A refusal puts both lists back where they were asking from, so the
@@ -942,6 +1161,57 @@ mod tests {
             pages.more_chats(true),
             Some(None),
             "a newly archived recent chat can sort before the old cursor"
+        );
+    }
+
+    #[test]
+    fn an_archived_load_in_flight_restarts_after_its_stale_answer() {
+        let mut pages = Pages::new();
+        assert_eq!(pages.more_chats(true), Some(None));
+        pages.reopen(&[]);
+        assert_eq!(pages.more_chats(true), None, "wait for the old answer");
+        assert_eq!(
+            pages.chat_page_arrived(true, None),
+            ChatPageArrival::Restarted,
+            "a stale terminal page must not finish the new scan"
+        );
+        assert_eq!(pages.more_chats(true), Some(None));
+        assert_eq!(
+            pages.chat_page_arrived(true, None),
+            ChatPageArrival::Applied
+        );
+    }
+
+    #[test]
+    fn a_lost_archived_load_with_pending_restart_starts_at_top() {
+        let mut pages = Pages::new();
+        pages.more_chats(true);
+        pages.chat_page_arrived(true, Some(cursor("old-next")));
+        assert_eq!(pages.more_chats(true), Some(Some(cursor("old-next"))));
+        pages.reopen(&[]);
+        assert!(pages.lost(None, true), "a new scan should be scheduled");
+        assert_eq!(pages.more_chats(true), Some(None));
+    }
+
+    #[test]
+    fn a_new_archived_scan_cancels_old_deferred_removal() {
+        let mut departed = HashSet::from([
+            "active@s.whatsapp.net".to_string(),
+            "restored@s.whatsapp.net".to_string(),
+            "reactivated@s.whatsapp.net".to_string(),
+        ]);
+        reconcile_departures(
+            &mut departed,
+            &HashSet::from(["active@s.whatsapp.net", "reactivated@s.whatsapp.net"]),
+            &HashSet::from([
+                "restored@s.whatsapp.net".to_string(),
+                "reactivated@s.whatsapp.net".to_string(),
+            ]),
+            Vec::new(),
+        );
+        assert_eq!(
+            departed,
+            HashSet::from(["active@s.whatsapp.net".to_string()])
         );
     }
 }

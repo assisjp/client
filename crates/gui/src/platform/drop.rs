@@ -46,6 +46,7 @@ mod imp {
         document: web_sys::Document,
         dragover: Closure<dyn FnMut(web_sys::DragEvent)>,
         drop: Closure<dyn FnMut(web_sys::DragEvent)>,
+        paste: Closure<dyn FnMut(web_sys::ClipboardEvent)>,
     }
 
     impl Drop for Listener {
@@ -57,6 +58,8 @@ mod imp {
             );
             let _ = target
                 .remove_event_listener_with_callback("drop", self.drop.as_ref().unchecked_ref());
+            let _ = target
+                .remove_event_listener_with_callback("paste", self.paste.as_ref().unchecked_ref());
         }
     }
 
@@ -68,10 +71,21 @@ mod imp {
             .and_then(|window| window.document())
             .ok_or_else(|| "the browser document is unavailable".to_string())?;
         let dragover = Closure::new(|event: web_sys::DragEvent| event.prevent_default());
-        let drop_entity = entity;
-        let mut app = cx;
+        let drop_entity = entity.clone();
+        let mut drop_app = cx.clone();
         let drop = Closure::new(move |event: web_sys::DragEvent| {
             event.prevent_default();
+            // Before the read: while the modal is open the files are still
+            // on the disk, so refusing here costs nothing and reading first
+            // would copy up to a trip's worth into memory merely to discard
+            // it. The race stays answered in `offer_dropped_files`.
+            if drop_entity
+                .update(&mut drop_app, |app, _| app.incoming_files_busy())
+                .unwrap_or(true)
+            {
+                let _ = drop_entity.update(&mut drop_app, |app, cx| app.warn_preview_busy(cx));
+                return;
+            }
             let Some(files) = event.data_transfer().and_then(|data| data.files()) else {
                 return;
             };
@@ -79,19 +93,75 @@ mod imp {
                 .filter_map(|index| files.get(index))
                 .collect::<Vec<_>>();
             let entity = drop_entity.clone();
-            let Some((jid, reply)) = entity
-                .update(&mut app, |app, cx| app.prepare_file_drop(cx))
+            let Some((jid, reply, epoch)) = entity
+                .update(&mut drop_app, |app, cx| app.prepare_incoming_files(cx))
                 .ok()
                 .flatten()
             else {
                 return;
             };
-            let mut task_app = app.clone();
-            app.foreground_executor()
+            let mut task_app = drop_app.clone();
+            drop_app
+                .foreground_executor()
                 .spawn(async move {
                     let chosen = read_files(files).await;
                     let _ = entity.update(&mut task_app, |app, cx| {
-                        app.finish_attaching(&jid, reply, Ok(chosen), cx)
+                        if app.finish_incoming_file_read(epoch) {
+                            app.offer_dropped_files(jid, reply, chosen, cx);
+                        }
+                    });
+                })
+                .detach();
+        });
+        // Pastes arrive through the document's `paste` event rather than the
+        // asynchronous clipboard API: the event carries the files directly —
+        // every kind, including videos gpui's own paste handler skips — with
+        // no permission prompt, for keyboard, menu and context-menu pastes
+        // alike. Text-only pastes carry no files and fall through to gpui's
+        // handler, which inserts them into the composer. Never
+        // `prevent_default` here: the event is also what feeds gpui's own
+        // paste handling.
+        let paste_entity = entity;
+        let mut paste_app = cx;
+        let paste = Closure::new(move |event: web_sys::ClipboardEvent| {
+            let files = event
+                .clipboard_data()
+                .and_then(|data| data.files())
+                .map(|list| {
+                    (0..list.length())
+                        .filter_map(|index| list.get(index))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if files.is_empty() {
+                return;
+            }
+            // Silent while the modal is open, like every other paste: the
+            // files are still on the clipboard, and reading them first
+            // would hold a trip's worth of memory merely to discard it.
+            if paste_entity
+                .update(&mut paste_app, |app, _| app.incoming_files_busy())
+                .unwrap_or(true)
+            {
+                return;
+            }
+            let Some((jid, reply, epoch)) = paste_entity
+                .update(&mut paste_app, |app, cx| app.prepare_incoming_files(cx))
+                .ok()
+                .flatten()
+            else {
+                return;
+            };
+            let entity = paste_entity.clone();
+            let mut task_app = paste_app.clone();
+            paste_app
+                .foreground_executor()
+                .spawn(async move {
+                    let chosen = read_files(files).await;
+                    let _ = entity.update(&mut task_app, |app, cx| {
+                        if app.finish_incoming_file_read(epoch) {
+                            app.offer_dropped_files(jid, reply, chosen, cx);
+                        }
                     });
                 })
                 .detach();
@@ -103,10 +173,14 @@ mod imp {
         target
             .add_event_listener_with_callback("drop", drop.as_ref().unchecked_ref())
             .map_err(|e| format!("could not listen for file drops: {e:?}"))?;
+        target
+            .add_event_listener_with_callback("paste", paste.as_ref().unchecked_ref())
+            .map_err(|e| format!("could not listen for pastes: {e:?}"))?;
         Ok(Listener {
             document,
             dragover,
             drop,
+            paste,
         })
     }
 

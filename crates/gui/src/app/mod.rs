@@ -286,7 +286,7 @@ pub use status::{Destination, StatusPane};
 pub use viewer::MediaViewer;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use indexmap::IndexMap;
@@ -689,6 +689,24 @@ pub struct WhatsAppApp {
     /// notification is a user-visible side effect rather than an idempotent
     /// timeline merge.
     notified_messages: IndexMap<(String, String, String), ()>,
+    /// The window handle used to finish opening a notification after its chat
+    /// arrives. A notification response can beat the first chat snapshot (or
+    /// a later archived page), so resolving only against `chats` at click time
+    /// would silently lose the action.
+    notification_window: Option<gpui::AnyWindowHandle>,
+    /// Clicked notifications whose chats are not hydrated in this window yet.
+    /// Keep them in click order so a burst of responses is retried one by one;
+    /// the newest click is consequently the final selection when both arrive.
+    pending_notification_tags: VecDeque<String>,
+    /// The most recent click wins focus. Older queued tags are still retried,
+    /// but resolving one after a newer click must never navigate backward.
+    latest_notification_tag: Option<String>,
+    /// Backoff task for a chat-list page refusal. A refused page otherwise
+    /// leaves a pending click waiting forever, while retrying inline can spin
+    /// if the daemon keeps refusing it.
+    #[allow(dead_code)]
+    notification_retry_task: Option<Task<()>>,
+    notification_retry_backoff: std::time::Duration,
     /// Whether the last gesture that touched a conversation was someone
     /// meaning to *talk* to it or meaning to *look* at it.
     ///
@@ -945,6 +963,33 @@ struct IncomingAlert {
     archived: Option<bool>,
 }
 
+const NOTIFICATION_PAGE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
+const MAX_NOTIFICATION_PAGE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn next_notification_retry_delay(current: std::time::Duration) -> std::time::Duration {
+    current
+        .checked_mul(2)
+        .unwrap_or(MAX_NOTIFICATION_PAGE_RETRY_DELAY)
+        .min(MAX_NOTIFICATION_PAGE_RETRY_DELAY)
+}
+
+/// Add a notification response once, retaining the newest occurrence at the
+/// back of the FIFO. A repeated click is a new ordering signal, not a second
+/// request for the same tag.
+fn enqueue_pending_notification(queue: &mut VecDeque<String>, tag: &str) {
+    if let Some(index) = queue.iter().position(|queued| queued == tag) {
+        queue.remove(index);
+    }
+    queue.push_back(tag.to_string());
+}
+
+fn remove_pending_notification(queue: &mut VecDeque<String>, tag: &str) -> bool {
+    let Some(index) = queue.iter().position(|queued| queued == tag) else {
+        return false;
+    };
+    queue.remove(index).is_some()
+}
+
 impl IncomingAlert {
     fn new(allowed: bool, title: Option<String>, archived: Option<bool>) -> Self {
         Self {
@@ -1073,7 +1118,18 @@ impl WhatsAppApp {
                             &*event,
                             UiEvent::MessageReceived { .. } | UiEvent::HistoryLoaded { .. }
                         );
+                        let hydration = matches!(&*event, UiEvent::HistoryLoaded { .. });
                         app.handle_event(*event, cx);
+                        if hydration {
+                            app.reset_notification_retry_backoff();
+                        }
+                        // A notification click may have arrived before the
+                        // list/history event that owns its chat. Retrying
+                        // after every session event is cheap when there is no
+                        // pending tag, and makes HistoryLoaded a valid retry
+                        // point without coupling the paging module to window
+                        // handles.
+                        app.retry_pending_notification(cx);
                         if bearing {
                             app.sweep_retained_media(cx);
                         }
@@ -1140,6 +1196,8 @@ impl WhatsAppApp {
                         archived,
                     } => entity.update(cx, |app, cx| {
                         app.apply_chat_page(chats, next, archived, cx);
+                        app.reset_notification_retry_backoff();
+                        app.retry_pending_notification(cx);
                     }),
                     // Who is in a group, for the line under its name.
                     FromDaemon::Members(roster) => entity.update(cx, |app, cx| {
@@ -1159,7 +1217,11 @@ impl WhatsAppApp {
                         app.draw_waiting_call_frames(cx);
                     }),
                     FromDaemon::PageLost { jid, archived } => entity.update(cx, |app, cx| {
+                        let chat_list_page = jid.is_none();
                         app.page_lost(jid, archived, cx);
+                        if chat_list_page {
+                            app.retry_pending_notification_after_page_loss(cx);
+                        }
                     }),
                     FromDaemon::StatusViewLost(message_ids) => entity.update(cx, |app, cx| {
                         app.forget_status_views(&message_ids, cx);
@@ -1232,6 +1294,11 @@ impl WhatsAppApp {
             window_focused: false,
             window_activation: None,
             notified_messages: IndexMap::new(),
+            notification_window: None,
+            pending_notification_tags: VecDeque::new(),
+            latest_notification_tag: None,
+            notification_retry_task: None,
+            notification_retry_backoff: NOTIFICATION_PAGE_RETRY_DELAY,
             // Nothing has been opened to talk to yet, and a window that comes
             // up on a restored selection is one nobody has typed into.
             keyboard_intent: ChatOpen::ToPreview,
@@ -1862,6 +1929,10 @@ impl WhatsAppApp {
         self.pending_pastes.clear();
         self.paste_preview = None;
         self.notified_messages.clear();
+        self.pending_notification_tags.clear();
+        self.latest_notification_tag = None;
+        self.notification_retry_task = None;
+        self.notification_retry_backoff = NOTIFICATION_PAGE_RETRY_DELAY;
         // A call is account state as much as a chat is. See
         // [`calls_ctl::Calls::forget`].
         self.calls.update(cx, |calls, cx| calls.forget(cx));
@@ -3209,6 +3280,120 @@ impl WhatsAppApp {
         }
     }
 
+    /// Give notification responses a handle that remains usable after the
+    /// click callback returns. Hydration can finish later, so keeping only the
+    /// callback's `&mut Window` would make a retry impossible.
+    pub fn set_notification_window(&mut self, window: gpui::AnyWindowHandle) {
+        self.notification_window = Some(window);
+    }
+
+    /// Retry queued notification responses after a chat/list hydration pass.
+    ///
+    /// The retry is deferred until the current entity update unwinds. GPUI
+    /// does not permit re-entering an entity while it is applying an event,
+    /// and the stored [`WindowHandle`] is the supported way to obtain a live
+    /// `Window` for the normal selection path. The FIFO is drained in order:
+    /// an older unresolved tag cannot let a newer click be overwritten by a
+    /// late selection, and the newest queued tag is the final selection.
+    pub(super) fn retry_pending_notification(&mut self, cx: &mut Context<Self>) {
+        if self.pending_notification_tags.is_empty() {
+            self.notification_retry_task = None;
+            self.notification_retry_backoff = NOTIFICATION_PAGE_RETRY_DELAY;
+            return;
+        }
+        let Some(window) = self.notification_window else {
+            return;
+        };
+
+        let entity = cx.entity().downgrade();
+        cx.defer(move |cx| {
+            let tags = entity
+                .update(cx, |app, _| {
+                    app.pending_notification_tags
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for tag in tags {
+                let result = window.update(cx, |_, window, cx| {
+                    entity
+                        .update(cx, |app, cx| {
+                            app.retry_queued_notification(&tag, window, cx)
+                        })
+                        .unwrap_or(false)
+                });
+                if result.is_err() {
+                    // A closed window leaves the
+                    // queue intact. A later hydration/page-loss event can
+                    // retry it without losing a response.
+                    break;
+                }
+            }
+        });
+    }
+
+    /// Retry one queued tag. Every snapshot entry is attempted once so an
+    /// unresolved older click cannot block a newer chat that already
+    /// hydrated.
+    fn retry_queued_notification(
+        &mut self,
+        tag: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self
+            .pending_notification_tags
+            .iter()
+            .any(|queued| queued == tag)
+        {
+            return true;
+        }
+        if let Some(jid) = notification_chat_jid(&self.chats, tag) {
+            let should_select = self.latest_notification_tag.as_deref() == Some(tag);
+            remove_pending_notification(&mut self.pending_notification_tags, tag);
+            self.reset_notification_retry_backoff();
+            if should_select {
+                self.select_chat(jid, ChatOpen::ToPreview, window, cx);
+            }
+            return true;
+        }
+        if self
+            .request_notification_pages(cx)
+            .is_some_and(|plan| plan.done())
+        {
+            // Both complete scans say the tag is not held by this account.
+            remove_pending_notification(&mut self.pending_notification_tags, tag);
+            self.reset_notification_retry_backoff();
+            return true;
+        }
+        false
+    }
+
+    fn reset_notification_retry_backoff(&mut self) {
+        self.notification_retry_task = None;
+        self.notification_retry_backoff = NOTIFICATION_PAGE_RETRY_DELAY;
+    }
+
+    /// Back off a notification retry after a chat-list page refusal. One task
+    /// serves the queue, so repeated failures cannot create a tight retry
+    /// loop or duplicate requests.
+    pub(super) fn retry_pending_notification_after_page_loss(&mut self, cx: &mut Context<Self>) {
+        if self.pending_notification_tags.is_empty() || self.notification_retry_task.is_some() {
+            return;
+        }
+        let delay = self.notification_retry_backoff;
+        self.notification_retry_backoff = next_notification_retry_delay(delay);
+        let entity = cx.entity().downgrade();
+        self.notification_retry_task = Some(cx.spawn(async move |_, cx| {
+            crate::platform::sleep(delay).await;
+            let _ = entity.update(cx, |app, cx| {
+                app.notification_retry_task = None;
+                app.retry_pending_notification(cx);
+            });
+        }));
+    }
+
     /// Open the conversation named by a system-notification response.
     ///
     /// The tag carries only a stable hash, not a phone number or JID. Resolve
@@ -3220,15 +3405,22 @@ impl WhatsAppApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(jid) = self
-            .chats
-            .iter()
-            .find(|chat| notification_tag(&chat.jid) == tag)
-            .map(|chat| chat.jid.clone())
-        else {
+        self.latest_notification_tag = Some(tag.to_string());
+        if let Some(jid) = notification_chat_jid(&self.chats, tag) {
+            remove_pending_notification(&mut self.pending_notification_tags, tag);
+            self.reset_notification_retry_backoff();
+            self.select_chat(jid, ChatOpen::ToPreview, window, cx);
+            // An older click may still be waiting; it remains queued for
+            // hydration but can no longer steal focus from this newer click.
+            self.retry_pending_notification(cx);
             return;
-        };
-        self.select_chat(jid, ChatOpen::ToPreview, window, cx);
+        }
+        // The response may arrive before the first HistoryLoaded/Chats page,
+        // or before the archived page that contains this chat. Queue it while
+        // unresolved; the hydrated branch above opens it immediately even if
+        // an older click is still waiting.
+        enqueue_pending_notification(&mut self.pending_notification_tags, tag);
+        self.retry_pending_notification(cx);
     }
 
     /// A server acknowledgement or peer receipt about our own messages:
@@ -3529,6 +3721,13 @@ fn notification_tag(jid: &str) -> String {
         hash = hash.wrapping_mul(1_099_511_628_211);
     }
     format!("oxidezap-chat-{hash:016x}")
+}
+
+fn notification_chat_jid(chats: &[Arc<Chat>], tag: &str) -> Option<String> {
+    chats
+        .iter()
+        .find(|chat| notification_tag(&chat.jid) == tag)
+        .map(|chat| chat.jid.clone())
 }
 
 /// The newest message in `chat` that the daemon has also seen.
@@ -3914,6 +4113,210 @@ mod tests {
         assert!(!read_is_allowed(true, true, false, false));
         assert!(!read_is_allowed(true, true, true, true));
         assert!(read_is_allowed(true, true, true, false));
+    }
+
+    #[test]
+    fn a_notification_tag_can_be_resolved_after_chat_hydration() {
+        let jid = "archived@example.invalid";
+        let tag = notification_tag(jid);
+        let mut chats = Vec::new();
+
+        // A response can arrive before either the active or archived page.
+        assert_eq!(notification_chat_jid(&chats, &tag), None);
+
+        let mut archived = Chat::with_name(jid.into(), "Archived contact".into());
+        archived.archived = true;
+        chats.push(Arc::new(archived));
+        assert_eq!(notification_chat_jid(&chats, &tag).as_deref(), Some(jid));
+    }
+
+    #[test]
+    fn notification_clicks_retry_in_fifo_order_with_newest_last() {
+        let mut queue = VecDeque::new();
+        enqueue_pending_notification(&mut queue, "chat-a");
+        enqueue_pending_notification(&mut queue, "chat-b");
+
+        assert_eq!(queue.pop_front().as_deref(), Some("chat-a"));
+        assert_eq!(queue.pop_front().as_deref(), Some("chat-b"));
+    }
+
+    #[test]
+    fn notification_click_queue_is_deduplicated_without_dropping_clicks() {
+        let mut queue = VecDeque::new();
+        enqueue_pending_notification(&mut queue, "chat-a");
+        enqueue_pending_notification(&mut queue, "chat-b");
+        enqueue_pending_notification(&mut queue, "chat-a");
+        assert_eq!(
+            queue.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["chat-b", "chat-a"]
+        );
+        enqueue_pending_notification(&mut queue, "chat-c");
+        assert_eq!(queue.len(), 3);
+        assert_eq!(queue.back().map(String::as_str), Some("chat-c"));
+    }
+
+    #[test]
+    fn notification_page_retry_backoff_doubles_and_is_capped() {
+        let mut delay = NOTIFICATION_PAGE_RETRY_DELAY;
+        assert_eq!(delay, std::time::Duration::from_millis(150));
+        for expected in [300, 600, 1_200, 2_400, 4_800, 9_600, 19_200] {
+            delay = next_notification_retry_delay(delay);
+            assert_eq!(delay, std::time::Duration::from_millis(expected));
+        }
+        assert_eq!(
+            next_notification_retry_delay(delay),
+            MAX_NOTIFICATION_PAGE_RETRY_DELAY
+        );
+        assert_eq!(
+            next_notification_retry_delay(MAX_NOTIFICATION_PAGE_RETRY_DELAY),
+            MAX_NOTIFICATION_PAGE_RETRY_DELAY
+        );
+    }
+
+    #[gpui::test]
+    fn queued_notification_clicks_select_newest_after_both_chats_hydrate(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            cx.set_app_identity("org.oxidezap.test", "OxideZap Test");
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            init_app_bindings(cx);
+        });
+        let mut app_entity = None;
+        let window = cx.open_window(gpui::size(gpui::px(1000.), gpui::px(800.)), |window, cx| {
+            let app = cx.new(|cx| {
+                let mut app = WhatsAppApp::new(cx);
+                app.app_state = AppState::Connected;
+                app.destination = Destination::Chats;
+                app
+            });
+            app_entity = Some(app.clone());
+            gpui_component::Root::new(app, window, cx)
+        });
+        let app = app_entity.unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+
+        let first_jid = "first@example.invalid";
+        let second_jid = "second@example.invalid";
+        let first_tag = notification_tag(first_jid);
+        let second_tag = notification_tag(second_jid);
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            app.update(cx, |app, cx| {
+                app.set_notification_window(window.window_handle());
+                app.open_system_notification(&first_tag, window, cx);
+                app.open_system_notification(&second_tag, window, cx);
+                assert_eq!(
+                    app.pending_notification_tags.iter().collect::<Vec<_>>(),
+                    [&first_tag, &second_tag]
+                );
+            });
+        });
+        // Both responses arrived before either row. Hydrate only the newer
+        // row first: an unresolved older entry must not block it.
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.chats.push(Arc::new(Chat::new(second_jid.to_string())));
+                app.retry_pending_notification(cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        cx.read(|cx| {
+            assert_eq!(app.read(cx).selected_chat.as_deref(), Some(second_jid));
+            assert_eq!(
+                app.read(cx)
+                    .pending_notification_tags
+                    .iter()
+                    .collect::<Vec<_>>(),
+                [&first_tag]
+            );
+        });
+
+        // The older tag is eventually consumed, but latest-click-wins keeps
+        // it from navigating away from the newer selection.
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.chats.push(Arc::new(Chat::new(first_jid.to_string())));
+                app.retry_pending_notification(cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        cx.read(|cx| {
+            assert_eq!(app.read(cx).selected_chat.as_deref(), Some(second_jid));
+            assert!(app.read(cx).pending_notification_tags.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn a_hydrated_newer_notification_opens_without_waiting_on_an_older_one(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            cx.set_app_identity("org.oxidezap.test", "OxideZap Test");
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            init_app_bindings(cx);
+        });
+        let mut app_entity = None;
+        let window = cx.open_window(gpui::size(gpui::px(1000.), gpui::px(800.)), |window, cx| {
+            let app = cx.new(|cx| {
+                let mut app = WhatsAppApp::new(cx);
+                app.app_state = AppState::Connected;
+                app.destination = Destination::Chats;
+                app
+            });
+            app_entity = Some(app.clone());
+            gpui_component::Root::new(app, window, cx)
+        });
+        let app = app_entity.unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+
+        let older_jid = "older@example.invalid";
+        let newer_jid = "newer@example.invalid";
+        let older_tag = notification_tag(older_jid);
+        let newer_tag = notification_tag(newer_jid);
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            app.update(cx, |app, cx| {
+                app.set_notification_window(window.window_handle());
+                app.open_system_notification(&older_tag, window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.chats.push(Arc::new(Chat::new(newer_jid.to_string())));
+                app.open_system_notification(&newer_tag, window, cx);
+                assert_eq!(app.selected_chat.as_deref(), Some(newer_jid));
+                assert_eq!(
+                    app.pending_notification_tags.iter().collect::<Vec<_>>(),
+                    [&older_tag]
+                );
+            });
+            window.draw(cx).clear(cx);
+        });
+
+        // The older tag is still retried, but its late resolution cannot
+        // steal focus from the newer click.
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.chats.push(Arc::new(Chat::new(older_jid.to_string())));
+                app.retry_pending_notification(cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        cx.read(|cx| {
+            assert_eq!(app.read(cx).selected_chat.as_deref(), Some(newer_jid));
+            assert!(app.read(cx).pending_notification_tags.is_empty());
+        });
     }
 
     #[gpui::test]

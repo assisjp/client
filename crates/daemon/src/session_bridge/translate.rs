@@ -304,6 +304,9 @@ impl Bridge {
                 // store is deciding whether the message unarchived/recreated
                 // it; a store-backed ChatUpdated clears the marker shortly.
                 if self.hub.chat(&chat_jid).is_none() && self.hub.chat_is_inactive(&chat_jid) {
+                    // `observe` recorded this message before translation.
+                    // It cannot be a read boundary for an inactive chat.
+                    self.reads().forget(&chat_jid);
                     return Vec::new();
                 }
                 let mut summary = self.hub.chat(&chat_jid).unwrap_or_else(|| ChatSummary {

@@ -235,6 +235,7 @@ fn render_row(
                 audio,
                 playback_speed: app.playback_speed(),
                 is_downloading: app.is_downloading(message_id),
+                is_preparing: app.is_audio_preparing(message_id),
             };
 
             render_message_bubble(props, entity.clone(), layout, cx).into_any_element()

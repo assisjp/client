@@ -311,6 +311,7 @@ mod tests {
                         audio: None,
                         playback_speed: 1.0,
                         is_downloading: false,
+                        is_preparing: false,
                     };
                     render_message_bubble(props, self.app.clone(), layout, cx)
                 }))

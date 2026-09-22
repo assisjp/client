@@ -77,6 +77,8 @@ pub struct BubbleProps {
     pub playback_speed: f32,
     /// Whether this message's media is being fetched right now.
     pub is_downloading: bool,
+    /// Whether its downloaded audio is being decoded or retimed for playback.
+    pub is_preparing: bool,
 }
 
 /// How far into the voice note the player is.
@@ -263,6 +265,7 @@ pub fn render_message_bubble(
                                             audio: props.audio,
                                             playback_speed: props.playback_speed,
                                             is_downloading: props.is_downloading,
+                                            is_preparing: props.is_preparing,
                                             max_media_size: layout.max_media_size(),
                                         },
                                         cx,

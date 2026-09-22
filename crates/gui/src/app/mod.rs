@@ -762,6 +762,10 @@ pub struct WhatsAppApp {
     /// Which playback the completion still in flight belongs to. See
     /// `stop_current_media`.
     playback_epoch: usize,
+    /// Voice-note decode/resample/time-stretch currently running off the UI
+    /// executor. The token also carries the position and pause intent needed
+    /// when a speed change arrives before the first preparation completes.
+    audio_preparation: Option<media_ctl::PendingAudioPreparation>,
     /// The deadline `status_tick` is waiting on, so an earlier one that
     /// arrives later can replace it rather than queue behind it.
     status_tick_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -1345,6 +1349,7 @@ impl WhatsAppApp {
             keyboard_intent: ChatOpen::ToPreview,
             keyboard_surfaces: KeyboardSurfaces::default(),
             playback_epoch: 0,
+            audio_preparation: None,
             status_tick_at: None,
             visible_chat: None,
             retained_chat: None,
@@ -1468,6 +1473,10 @@ impl WhatsAppApp {
     /// Navigate back to chat list (for mobile)
     pub fn navigate_back(&mut self, cx: &mut Context<Self>) {
         self.mobile_panel = MobilePanel::ChatList;
+        // Keep an in-flight media download alive, but revoke its autoplay
+        // intent: its answer may arrive after this conversation is no longer
+        // on screen and must not start audio behind the chat list.
+        self.cancel_hidden_media_autoplay();
         // Leaving the panel means leaving what was in it: a status left open
         // would put the window straight back into it on the next layout,
         // since the panel is derived from whether there is anything to show.

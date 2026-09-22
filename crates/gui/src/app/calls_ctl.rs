@@ -1024,6 +1024,13 @@ impl WhatsAppApp {
         log::debug!("keyboard: {:?} -> {wanted:?}", self.keyboard_owner);
         match &wanted {
             KeyboardOwner::RingingCall(_) => window.focus(&self.call_focus, cx),
+            KeyboardOwner::MessageDelete => window.focus(&self.message_delete_focus, cx),
+            KeyboardOwner::MessageEdit => {
+                if let Some(draft) = self.edit_draft.as_ref() {
+                    let focus = draft.input.read(cx).focus_handle(cx);
+                    window.focus(&focus, cx);
+                }
+            }
             KeyboardOwner::PastePreview => window.focus(&self.paste_preview_focus, cx),
             KeyboardOwner::Viewer => {
                 let handle = self.viewer.read(cx).focus().clone();
@@ -1140,6 +1147,8 @@ fn keyboard_owner_for(
     let composing = intent == ChatOpen::ToCompose;
     match ringing_call.filter(|_| surfaces.call_card) {
         Some(call_id) => KeyboardOwner::RingingCall(call_id),
+        None if surfaces.message_delete => KeyboardOwner::MessageDelete,
+        None if surfaces.message_edit => KeyboardOwner::MessageEdit,
         None if surfaces.paste_preview => KeyboardOwner::PastePreview,
         None if surfaces.viewer => KeyboardOwner::Viewer,
         None if showing_settings => KeyboardOwner::Screen,
@@ -1215,6 +1224,8 @@ mod keyboard_owner_tests {
         composer: false,
         viewer: false,
         paste_preview: false,
+        message_edit: false,
+        message_delete: false,
         call_card: false,
     };
 
@@ -1237,6 +1248,8 @@ mod keyboard_owner_tests {
             composer: true,
             viewer: true,
             paste_preview: true,
+            message_edit: false,
+            message_delete: false,
             call_card: true,
         };
         assert_eq!(

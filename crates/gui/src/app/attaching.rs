@@ -43,6 +43,12 @@ impl WhatsAppApp {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Option<(String, Option<ReplyDraft>)> {
+        // The confirmation surface owns the one pending selection. Do not
+        // start another picker/drop read behind it: the source would produce
+        // accepted files with no second surface to present them on.
+        if self.paste_preview.is_some() {
+            return None;
+        }
         if self.destination != Destination::Chats {
             return None;
         }
@@ -66,6 +72,9 @@ impl WhatsAppApp {
     /// rather than being read again at the end: somebody who picks a file and
     /// then opens another chat meant to send it to the first.
     pub(super) fn attach_files(&mut self, cx: &mut Context<Self>) {
+        if self.paste_preview.is_some() {
+            return;
+        }
         let Some(jid) = self.selected_chat.clone() else {
             return;
         };
@@ -119,29 +128,52 @@ impl WhatsAppApp {
             self.notify_user(refusal, notices::Tone::Problem, cx);
         }
 
-        // The quote goes on the first file only. Attaching four photos to
-        // answer one message is one answer, and quoting it four times is what
-        // the recipient would see otherwise.
-        //
-        // And only where there is a first file: a trip that refused everything
-        // it was given sent nothing, so taking the draft there would clear the
-        // reply bar over a message the person is still composing an answer to.
-        let mut quoted = if chosen.files.is_empty() {
-            None
-        } else {
-            self.take_reply_draft(reply, cx)
-        };
-        let mut drawn = false;
-        for file in chosen.files {
-            drawn |= self.send_attachment(jid, file, quoted.take(), cx);
+        // Refusals can leave a selection with no accepted files. In that case
+        // there is nothing to confirm and, importantly, no reply draft to
+        // consume merely because the chooser returned an error notice.
+        if chosen.files.is_empty() {
+            return;
         }
 
-        // Following the file down is only what the sender expects if they are
-        // looking at where it landed — the same rule a voice note follows,
-        // and for the same reason: reading a conversation must not be yanked
-        // to its newest message by something that finished elsewhere.
-        if drawn && self.visible_chat.as_deref() == Some(jid) {
-            self.scroll_to_last_message();
+        // Keep every accepted file behind one confirmation. The destination
+        // and reply were captured before asynchronous picker/drop reading, so
+        // changing chats while the files are being read cannot redirect them.
+        let files = chosen.files;
+        let images = crate::components::preview_images(&files);
+        let chat_was_visible = self.visible_chat.as_deref() == Some(jid);
+        self.queue_paste_preview(
+            PendingPastePreview {
+                jid: jid.to_string(),
+                reply,
+                files,
+                images,
+                chat_was_visible,
+            },
+            cx,
+        );
+    }
+
+    /// Put one accepted selection behind the shared confirmation surface.
+    ///
+    /// Picker, drop and clipboard reads may overlap before their first result
+    /// reaches the UI. A FIFO here makes that race visible as sequential
+    /// confirmations rather than silently losing the later accepted files.
+    pub(super) fn queue_paste_preview(
+        &mut self,
+        preview: PendingPastePreview,
+        cx: &mut Context<Self>,
+    ) {
+        if self.paste_preview.is_none() {
+            self.paste_preview = Some(preview);
+        } else {
+            self.pending_attachment_previews.push_back(preview);
+        }
+        cx.notify();
+    }
+
+    fn show_next_paste_preview(&mut self) {
+        if self.paste_preview.is_none() {
+            self.paste_preview = self.pending_attachment_previews.pop_front();
         }
     }
 
@@ -171,6 +203,7 @@ impl WhatsAppApp {
     pub(crate) fn cancel_paste_preview(&mut self, cx: &mut Context<Self>) -> bool {
         let cancelled = self.paste_preview.take().is_some();
         if cancelled {
+            self.show_next_paste_preview();
             cx.notify();
         }
         cancelled
@@ -180,13 +213,20 @@ impl WhatsAppApp {
         let Some(preview) = self.paste_preview.take() else {
             return;
         };
-        let quoted = self.take_reply_draft(preview.reply, cx);
-        let drawn = self.send_attachment(&preview.jid, preview.file, quoted, cx);
+        // Quote only the first accepted file, just like the old immediate
+        // multi-file path. Taking the preview before sending makes a repeated
+        // activation a no-op and therefore cannot duplicate uploads/bubbles.
+        let mut quoted = self.take_reply_draft(preview.reply, cx);
+        let mut drawn = false;
+        for file in preview.files {
+            drawn |= self.send_attachment(&preview.jid, file, quoted.take(), cx);
+        }
         let destination_still_open = self.destination == Destination::Chats
             && self.selected_chat.as_deref() == Some(preview.jid.as_str());
         if drawn && preview.chat_was_visible && destination_still_open {
             self.scroll_to_last_message();
         }
+        self.show_next_paste_preview();
         cx.notify();
     }
 
@@ -309,9 +349,11 @@ fn image_size(bytes: &[u8]) -> (Option<u32>, Option<u32>) {
 
 #[cfg(test)]
 mod tests {
+    use gpui::AppContext as _;
     use oxidezap_core::{MediaType, OutgoingMedia};
 
     use super::echo_of;
+    use crate::app::WhatsAppApp;
     use crate::platform::picker::{Picked, kind_for};
 
     /// A file of this type, with bytes that are nothing in particular: what is
@@ -372,5 +414,154 @@ mod tests {
             assert_eq!(echo.media_type, MediaType::Image, "{photo}");
             assert_eq!(echo.data.len(), file.bytes.len(), "{photo}");
         }
+    }
+
+    #[gpui::test]
+    fn overlapping_picker_results_are_queued_for_confirmation(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let app = cx.update(|cx| cx.new(WhatsAppApp::new));
+        let first = picked("first.pdf", "application/pdf");
+        let second = picked("second.mp4", "video/mp4");
+
+        app.update(cx, |app, cx| {
+            app.finish_attaching(
+                "peer@example.invalid",
+                None,
+                Ok(crate::platform::picker::Chosen {
+                    files: vec![first.clone()],
+                    refused: Vec::new(),
+                }),
+                cx,
+            );
+            app.finish_attaching(
+                "peer@example.invalid",
+                None,
+                Ok(crate::platform::picker::Chosen {
+                    files: vec![second.clone()],
+                    refused: Vec::new(),
+                }),
+                cx,
+            );
+        });
+
+        cx.read(|cx| {
+            let app = app.read(cx);
+            assert_eq!(
+                app.paste_preview.as_ref().unwrap().files[0].file_name,
+                first.file_name
+            );
+            assert_eq!(app.pending_attachment_previews.len(), 1);
+        });
+
+        app.update(cx, |app, cx| {
+            assert!(app.cancel_paste_preview(cx));
+        });
+        cx.read(|cx| {
+            let app = app.read(cx);
+            assert_eq!(
+                app.paste_preview.as_ref().unwrap().files[0].file_name,
+                second.file_name
+            );
+            assert!(app.attachment_attempts.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn multi_file_choice_waits_for_one_explicit_confirmation(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let app = cx.update(|cx| cx.new(WhatsAppApp::new));
+        let files = vec![
+            picked("first.pdf", "application/pdf"),
+            picked("second.mp4", "video/mp4"),
+        ];
+        let reply = crate::components::ReplyDraft {
+            message_id: "QUOTED-1".into(),
+            sender: "peer@example.invalid".into(),
+            sender_name: "Peer".into(),
+            preview: "Earlier message".into(),
+            kind: None,
+        };
+
+        app.update(cx, |app, cx| {
+            app.reply_to = Some(reply.clone());
+            app.finish_attaching(
+                "original-chat@example.invalid",
+                Some(reply.clone()),
+                Ok(crate::platform::picker::Chosen {
+                    files: files.clone(),
+                    refused: vec!["third.bin was too large".into()],
+                }),
+                cx,
+            );
+            assert!(app.attachment_attempts.is_empty());
+            let preview = app.paste_preview.as_ref().expect("choice opens preview");
+            assert_eq!(preview.jid, "original-chat@example.invalid");
+            assert_eq!(preview.files.len(), 2);
+            assert_eq!(preview.files[0].file_name, "first.pdf");
+            assert_eq!(preview.files[1].file_name, "second.mp4");
+            assert_eq!(app.reply_to.as_ref().unwrap().message_id, "QUOTED-1");
+        });
+
+        // Switching chats cannot redirect what the picker originally chose.
+        app.update(cx, |app, cx| {
+            app.selected_chat = Some("other-chat@example.invalid".into());
+            app.confirm_paste_preview(cx);
+            app.confirm_paste_preview(cx);
+            assert!(app.paste_preview.is_none());
+            assert_eq!(app.attachment_attempts.len(), 2);
+            assert_eq!(app.attachment_attempts[0].file_name, "first.pdf");
+            assert_eq!(app.attachment_attempts[1].file_name, "second.mp4");
+            assert!(app.reply_to.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn refusal_only_and_cancel_never_send_or_consume_reply(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let app = cx.update(|cx| cx.new(WhatsAppApp::new));
+        let reply = crate::components::ReplyDraft {
+            message_id: "QUOTED-2".into(),
+            sender: "peer@example.invalid".into(),
+            sender_name: "Peer".into(),
+            preview: "Earlier message".into(),
+            kind: None,
+        };
+        app.update(cx, |app, cx| {
+            app.reply_to = Some(reply.clone());
+            app.finish_attaching(
+                "peer@example.invalid",
+                Some(reply.clone()),
+                Ok(crate::platform::picker::Chosen {
+                    files: Vec::new(),
+                    refused: vec!["oversized.pdf was too large".into()],
+                }),
+                cx,
+            );
+            assert!(app.paste_preview.is_none());
+            assert!(app.attachment_attempts.is_empty());
+            assert_eq!(app.reply_to.as_ref().unwrap().message_id, "QUOTED-2");
+
+            app.finish_attaching(
+                "peer@example.invalid",
+                Some(reply),
+                Ok(crate::platform::picker::Chosen {
+                    files: vec![picked("safe.pdf", "application/pdf")],
+                    refused: Vec::new(),
+                }),
+                cx,
+            );
+            assert!(app.cancel_paste_preview(cx));
+            assert!(app.attachment_attempts.is_empty());
+            assert_eq!(app.reply_to.as_ref().unwrap().message_id, "QUOTED-2");
+        });
     }
 }

@@ -1,20 +1,40 @@
-//! Confirmation surface for an image read from the clipboard.
+//! Confirmation surface shared by clipboard, picker, and file-drop attachments.
 
 use std::sync::Arc;
 
 use gpui::{
     App, Entity, FocusHandle, Image, ImageSource, InteractiveElement as _, IntoElement, ObjectFit,
-    ParentElement as _, Styled as _, StyledImage as _, div, img,
+    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _,
+    StyledImage as _, div, img,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::{Disableable as _, FocusTrapElement as _};
+use gpui_component::{ActiveTheme as _, Disableable as _, FocusTrapElement as _};
 
 use crate::app::WhatsAppApp;
 use crate::components::parts;
+use crate::platform::picker::{Picked, kind_for};
 use crate::theme::Metrics;
+use crate::utils::{format_size, mime_to_image_format};
+
+/// Build the visual payloads for a pending attachment selection once, while
+/// the confirmation surface owns the files. Videos, audio and documents do
+/// not have a local still renderer here, so their card carries the identity
+/// that will be sent instead of pretending a thumbnail exists.
+pub fn preview_images(files: &[Picked]) -> Vec<Option<Arc<Image>>> {
+    files
+        .iter()
+        .map(|file| {
+            (kind_for(&file.mime_type) == oxidezap_core::OutgoingMedia::Image)
+                .then(|| mime_to_image_format(&file.mime_type))
+                .flatten()
+                .map(|format| Arc::new(Image::from_bytes(format, file.bytes.clone())))
+        })
+        .collect()
+}
 
 pub fn render_paste_preview(
-    image: Arc<Image>,
+    files: &[Picked],
+    images: &[Option<Arc<Image>>],
     app: Entity<WhatsAppApp>,
     can_send: bool,
     focus_handle: &FocusHandle,
@@ -40,7 +60,11 @@ pub fn render_paste_preview(
             div()
                 .text_size(metrics.text_title())
                 .text_color(parts::on_scrim(cx))
-                .child("Send this image?"),
+                .child(if files.len() == 1 {
+                    "Send this attachment?"
+                } else {
+                    "Send these attachments?"
+                }),
         )
         .child(
             div()
@@ -51,10 +75,13 @@ pub fn render_paste_preview(
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(
-                    img(ImageSource::Image(image))
-                        .size_full()
-                        .object_fit(ObjectFit::Contain),
+                .gap(metrics.space_lg())
+                .flex_wrap()
+                .overflow_y_scroll()
+                .children(
+                    files.iter().zip(images.iter()).map(|(file, image)| {
+                        render_preview_item(file, image.as_ref(), metrics, cx)
+                    }),
                 ),
         )
         .child(
@@ -95,4 +122,137 @@ pub fn render_paste_preview(
                 ),
         )
         .focus_trap("paste-preview-trap", focus_handle)
+}
+
+fn render_file_card(file: &Picked, metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
+    let kind = match kind_for(&file.mime_type) {
+        oxidezap_core::OutgoingMedia::Image => "Image",
+        oxidezap_core::OutgoingMedia::Video => "Video",
+        oxidezap_core::OutgoingMedia::Document => "Document",
+    };
+    let name: SharedString = file.file_name.clone().into();
+    let mime: SharedString = file.mime_type.clone().into();
+    let size = format_size(file.bytes.len() as u64);
+    div()
+        .max_w_full()
+        .p(metrics.space_xl())
+        .gap(metrics.space_sm())
+        .flex()
+        .flex_col()
+        .items_center()
+        .bg(cx.theme().secondary)
+        .border_1()
+        .border_color(cx.theme().border)
+        .rounded(metrics.radius_lg())
+        .child(
+            div()
+                .text_size(metrics.text_title())
+                .text_color(cx.theme().foreground)
+                .child(kind),
+        )
+        .child(
+            div()
+                .max_w_full()
+                .text_size(metrics.text_body())
+                .text_color(cx.theme().foreground)
+                .overflow_hidden()
+                .child(name),
+        )
+        .child(
+            div()
+                .max_w_full()
+                .text_size(metrics.text_small())
+                .text_color(cx.theme().muted_foreground)
+                .overflow_hidden()
+                .child(format!("{mime} · {size}")),
+        )
+}
+
+fn render_preview_item(
+    file: &Picked,
+    image: Option<&Arc<Image>>,
+    metrics: Metrics,
+    cx: &App,
+) -> gpui::AnyElement {
+    match image {
+        Some(image) => div()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .gap(metrics.space_sm())
+            .child(
+                img(ImageSource::Image(image.clone()))
+                    .flex_1()
+                    .min_h_0()
+                    .size_full()
+                    .object_fit(ObjectFit::Contain),
+            )
+            .child(render_file_meta(file, metrics, cx))
+            .into_any_element(),
+        None => render_file_card(file, metrics, cx).into_any_element(),
+    }
+}
+
+fn render_file_meta(file: &Picked, metrics: Metrics, cx: &App) -> impl IntoElement + use<> {
+    let name: SharedString = file.file_name.clone().into();
+    let detail = format!(
+        "{} · {}",
+        file.mime_type,
+        format_size(file.bytes.len() as u64)
+    );
+    div()
+        .max_w_full()
+        .flex()
+        .flex_col()
+        .items_center()
+        .text_size(metrics.text_small())
+        .text_color(cx.theme().foreground)
+        .overflow_hidden()
+        .child(name)
+        .child(
+            div()
+                .max_w_full()
+                .text_size(metrics.text_micro())
+                .text_color(cx.theme().muted_foreground)
+                .overflow_hidden()
+                .child(detail),
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preview_images;
+    use crate::platform::picker::Picked;
+
+    fn picked(file_name: &str, mime_type: &str) -> Picked {
+        Picked {
+            file_name: file_name.to_owned(),
+            mime_type: mime_type.to_owned(),
+            bytes: vec![1, 2, 3],
+        }
+    }
+
+    #[test]
+    fn preview_payloads_keep_picker_order_and_media_identity() {
+        let files = vec![
+            picked("photo.png", "image/png"),
+            picked("clip.mp4", "video/mp4"),
+            picked("notes.pdf", "application/pdf"),
+        ];
+
+        let images = preview_images(&files);
+
+        assert_eq!(images.len(), files.len());
+        assert!(images[0].is_some(), "supported image gets a thumbnail");
+        assert!(images[1].is_none(), "video remains an identified file card");
+        assert!(
+            images[2].is_none(),
+            "document remains an identified file card"
+        );
+        assert_eq!(files[0].file_name, "photo.png");
+        assert_eq!(files[1].file_name, "clip.mp4");
+        assert_eq!(files[2].file_name, "notes.pdf");
+    }
 }

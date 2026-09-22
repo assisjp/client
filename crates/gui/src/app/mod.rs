@@ -18,6 +18,7 @@ mod events;
 mod frame_cost;
 mod media;
 mod media_ctl;
+mod message_actions;
 mod messages;
 pub mod notices;
 mod paging;
@@ -38,6 +39,7 @@ pub use chats::{
     ChatFilter, ChatListCache, Survival, survives_archived_scan, survives_complete_load,
 };
 pub use media::RecordingState;
+pub(crate) use message_actions::{can_delete_sent, can_edit_sent};
 pub use messages::{BubbleIds, MessageListCache, TimelineItem};
 pub use paging::nearing_end;
 
@@ -125,6 +127,10 @@ enum KeyboardOwner {
     /// A call that is ringing — not one that has been answered, which is a
     /// call people type through.
     RingingCall(String),
+    /// A sent message's replacement text, in its own modal field.
+    MessageEdit,
+    /// An addressed sent-message deletion awaiting final confirmation.
+    MessageDelete,
     /// An image pasted into the composer, waiting for explicit confirmation.
     PastePreview,
     /// The fullscreen viewer, which owns the arrow keys while it is up.
@@ -156,17 +162,24 @@ pub struct KeyboardSurfaces {
     /// `leave_connected_view` does not close it — while the error screen that
     /// replaces the conversation draws nothing of it.
     pub viewer: bool,
-    /// The modal preview for a pasted image.
+    /// The modal preview for a pending attachment selection.
     pub paste_preview: bool,
+    pub message_edit: bool,
+    pub message_delete: bool,
     /// The call card, which only the connected screens float.
     pub call_card: bool,
 }
 
+/// Files held behind the shared attachment confirmation surface.
+///
+/// Pasted images were the first source to gain this boundary, so the state
+/// keeps its historical name. Picker and drop inputs use the same owner and
+/// consume-once confirmation path rather than creating a second modal flow.
 struct PendingPastePreview {
     jid: String,
     reply: Option<ReplyDraft>,
-    file: crate::platform::picker::Picked,
-    image: Arc<gpui::Image>,
+    files: Vec<crate::platform::picker::Picked>,
+    images: Vec<Option<Arc<gpui::Image>>>,
     /// Whether the captured destination was the conversation on screen before
     /// this modal deliberately hid it from read/paging accounting.
     chat_was_visible: bool,
@@ -286,7 +299,7 @@ pub use status::{Destination, StatusPane};
 pub use viewer::MediaViewer;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use indexmap::IndexMap;
@@ -363,8 +376,23 @@ pub struct RetryMessage {
     pub id: gpui::SharedString,
 }
 
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = message, no_json)]
+pub struct EditSentMessage {
+    pub jid: gpui::SharedString,
+    pub id: gpui::SharedString,
+}
+
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = message, no_json)]
+pub struct DeleteSentMessage {
+    pub jid: gpui::SharedString,
+    pub id: gpui::SharedString,
+    pub for_everyone: bool,
+}
+
 use crate::components::{
-    AccountSummary, InputAreaEvent, InputAreaView, ReplyDraft, new_timeline_state,
+    AccountSummary, InputAreaEvent, InputAreaView, ReplyDraft, new_timeline_state, preview_images,
     render_paste_preview,
 };
 use log::{debug, error, info, warn};
@@ -656,6 +684,10 @@ pub struct WhatsAppApp {
     /// Destination captured while an asynchronous clipboard read is pending.
     pending_pastes: HashMap<u64, (String, Option<ReplyDraft>)>,
     paste_preview: Option<PendingPastePreview>,
+    /// Accepted selections that completed while another confirmation was open.
+    /// Keeping these instead of dropping a late picker/drop result guarantees
+    /// every accepted attachment gets the same explicit confirmation surface.
+    pending_attachment_previews: VecDeque<PendingPastePreview>,
     #[cfg(test)]
     attachment_attempts: Vec<crate::platform::picker::Picked>,
     /// Scroll handle for chat list
@@ -670,6 +702,8 @@ pub struct WhatsAppApp {
     call_focus: FocusHandle,
     /// Focus target for the pasted-image confirmation modal.
     paste_preview_focus: FocusHandle,
+    /// Focus target for the sent-message deletion confirmation modal.
+    message_delete_focus: FocusHandle,
     /// Focus target for the window itself, so the actions hung off the root
     /// are reachable whatever else is on screen — including on the screens on
     /// the way to a conversation, which have no list and no composer to
@@ -900,6 +934,11 @@ pub struct WhatsAppApp {
     /// The message being replied to, mirrored here so the send path can
     /// attach it and the composer can show it.
     reply_to: Option<ReplyDraft>,
+    edit_draft: Option<message_actions::EditDraft>,
+    delete_confirmation: Option<message_actions::DeleteConfirmation>,
+    pending_message_actions: HashSet<(String, String)>,
+    #[cfg(test)]
+    delete_attempts: Vec<(String, String, bool)>,
     /// Who is typing and who is around. Expires on its own, so it is view
     /// state rather than anything the store carries.
     presence: PresenceRegistry,
@@ -1220,6 +1259,7 @@ impl WhatsAppApp {
             client: None,
             pending_pastes: HashMap::new(),
             paste_preview: None,
+            pending_attachment_previews: VecDeque::new(),
             #[cfg(test)]
             attachment_attempts: Vec::new(),
             chat_list_scroll: VirtualListScrollHandle::new(),
@@ -1227,6 +1267,7 @@ impl WhatsAppApp {
             chat_list_focus: cx.focus_handle(),
             call_focus: cx.focus_handle(),
             paste_preview_focus: cx.focus_handle(),
+            message_delete_focus: cx.focus_handle(),
             root_focus: cx.focus_handle(),
             keyboard_owner: None,
             window_focused: false,
@@ -1288,6 +1329,11 @@ impl WhatsAppApp {
             mobile_panel: MobilePanel::default(),
             chat_filter: ChatFilter::default(),
             reply_to: None,
+            edit_draft: None,
+            delete_confirmation: None,
+            pending_message_actions: HashSet::new(),
+            #[cfg(test)]
+            delete_attempts: Vec::new(),
             presence: PresenceRegistry::new(),
             account_name: None,
             account_jid: None,
@@ -1861,6 +1907,8 @@ impl WhatsAppApp {
         self.leave_connected_view(cx);
         self.pending_pastes.clear();
         self.paste_preview = None;
+        self.delete_confirmation = None;
+        self.pending_attachment_previews.clear();
         self.notified_messages.clear();
         // A call is account state as much as a chat is. See
         // [`calls_ctl::Calls::forget`].
@@ -1949,6 +1997,8 @@ impl WhatsAppApp {
     /// Not [`AppState::Offline`]: that keeps the conversation on screen and
     /// only refuses to send.
     fn leave_connected_view(&mut self, cx: &mut Context<Self>) {
+        self.edit_draft = None;
+        self.delete_confirmation = None;
         if self.recorder.read(cx).state() != RecordingState::Idle {
             self.cancel_recording(cx);
         }
@@ -2411,6 +2461,10 @@ impl WhatsAppApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.selected_chat.as_deref() != Some(jid.as_str()) {
+            self.cancel_message_edit(cx);
+            self.cancel_message_delete(cx);
+        }
         self.stop_current_media();
         // Leaving a chat mid-composition: release its typing indicator now,
         // or it would stay "typing..." and the eventual paused would land on
@@ -2702,21 +2756,19 @@ impl WhatsAppApp {
                 let Some((jid, reply)) = self.pending_pastes.remove(paste_id) else {
                     return;
                 };
-                let Some(format) = gpui::ImageFormat::from_mime_type(&file.mime_type) else {
-                    return;
-                };
-                if self.paste_preview.is_none() {
-                    let image = Arc::new(gpui::Image::from_bytes(format, file.bytes.clone()));
-                    let chat_was_visible = self.visible_chat.as_deref() == Some(jid.as_str());
-                    self.paste_preview = Some(PendingPastePreview {
+                let files = vec![file];
+                let images = preview_images(&files);
+                let chat_was_visible = self.visible_chat.as_deref() == Some(jid.as_str());
+                self.queue_paste_preview(
+                    PendingPastePreview {
                         jid,
                         reply,
-                        file,
-                        image,
+                        files,
+                        images,
                         chat_was_visible,
-                    });
-                    cx.notify();
-                }
+                    },
+                    cx,
+                );
             }
             InputAreaEvent::PasteImageError(paste_id, error) => {
                 if self.pending_pastes.remove(paste_id).is_some() {
@@ -3709,6 +3761,12 @@ impl Render for WhatsAppApp {
             .on_action(cx.listener(|app, retry: &RetryMessage, window, cx| {
                 app.retry_send(&retry.id, window, cx);
             }))
+            .on_action(cx.listener(|app, edit: &EditSentMessage, window, cx| {
+                app.begin_message_edit(&edit.jid, &edit.id, window, cx);
+            }))
+            .on_action(cx.listener(|app, delete: &DeleteSentMessage, _window, cx| {
+                app.begin_message_delete(&delete.jid, &delete.id, delete.for_everyone, cx);
+            }))
             .on_action(|copy: &CopyMessage, _window, cx| {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.text.to_string()));
             })
@@ -3731,11 +3789,24 @@ impl Render for WhatsAppApp {
 
         let paste_preview = self.paste_preview.as_ref().map(|preview| {
             render_paste_preview(
-                preview.image.clone(),
+                &preview.files,
+                &preview.images,
                 cx.entity().clone(),
                 self.can_send(),
                 &self.paste_preview_focus,
                 cx.product().metrics,
+                cx,
+            )
+            .into_any_element()
+        });
+        let message_edit = self.edit_draft.as_ref().map(|draft| {
+            message_actions::render_message_edit(draft, cx.entity().clone(), cx).into_any_element()
+        });
+        let message_delete = self.delete_confirmation.as_ref().map(|confirmation| {
+            message_actions::render_message_delete(
+                confirmation,
+                cx.entity().clone(),
+                &self.message_delete_focus,
                 cx,
             )
             .into_any_element()
@@ -3745,6 +3816,8 @@ impl Render for WhatsAppApp {
         // one the root answers for.
         let call_card = call_overlay.is_some();
         let paste_preview_open = paste_preview.is_some();
+        let message_edit_open = message_edit.is_some();
+        let message_delete_open = message_delete.is_some();
 
         // Above the call card as well as the body: a notice raised by
         // something the call did is about the call, and a card that covered
@@ -3754,6 +3827,8 @@ impl Render for WhatsAppApp {
         // nothing at all while it is empty.
         root.child(body.cached(gpui::StyleRefinement::default().size_full()))
             .children(paste_preview)
+            .children(message_edit)
+            .children(message_delete)
             .children(call_overlay)
             .child(self.notices().clone())
             // Cached views report their surfaces in prepaint. Move focus after
@@ -3764,6 +3839,8 @@ impl Render for WhatsAppApp {
                         entity.update(cx, |app, _| {
                             app.keyboard_surfaces.call_card = call_card;
                             app.keyboard_surfaces.paste_preview = paste_preview_open;
+                            app.keyboard_surfaces.message_edit = message_edit_open;
+                            app.keyboard_surfaces.message_delete = message_delete_open;
                         });
                         let entity = entity.downgrade();
                         window.defer(cx, move |window, cx| {

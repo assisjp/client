@@ -2069,6 +2069,7 @@ impl WhatsAppClient {
             },
             quoted: quoted_from(base_msg),
             revoked: false,
+            edited: false,
             system: None,
         };
 

@@ -93,6 +93,7 @@ pub(super) fn stored_to_chat_message(stored: oxidezap_chat_store::StoredMessage)
         },
         quoted,
         revoked: stored.revoked,
+        edited: stored.edited_at.is_some(),
         system: None,
     }
 }

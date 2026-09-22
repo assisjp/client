@@ -327,6 +327,12 @@ impl WhatsAppApp {
             self.decline_waiting_call(cx);
             return;
         }
+        if self.cancel_message_delete(cx) {
+            return;
+        }
+        if self.cancel_message_edit(cx) {
+            return;
+        }
         if self.cancel_paste_preview(cx) {
             return;
         }

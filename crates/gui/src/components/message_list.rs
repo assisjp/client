@@ -221,6 +221,7 @@ fn render_row(
                 elapsed_secs: app.audio_elapsed_secs(),
             });
             let props = BubbleProps {
+                chat_jid: app.selected_chat_jid().unwrap_or_default(),
                 ids: ids.clone(),
                 text: text.clone(),
                 message: Arc::clone(msg),

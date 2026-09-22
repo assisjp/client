@@ -5,6 +5,10 @@ use std::path::PathBuf;
 /// Bumped whenever a frame changes shape in a way an older peer would
 /// misread. The daemon refuses a mismatch rather than guessing.
 ///
+/// 35: `ClientRequest::EditMessage` and `RevokeMessage` let the GUI request
+/// existing session mutations with an addressed completion. An older daemon
+/// does not know these commands and would silently refuse a menu action.
+///
 /// 34: `LoadChats.archived` lets the desktop request the store's
 /// include-archived view, and full `Chat` frames carry the durable archive
 /// state used to separate that view. A v33 daemon would ignore the request
@@ -257,7 +261,7 @@ use std::path::PathBuf;
 /// would misparse the first three and not recognise the rest.
 ///
 /// [`PairingCode`]: crate::PairingCode
-pub const PROTOCOL_VERSION: u32 = 34;
+pub const PROTOCOL_VERSION: u32 = 35;
 
 /// Where the daemon's web bridge listens when nobody says otherwise.
 ///

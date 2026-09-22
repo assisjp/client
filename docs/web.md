@@ -468,3 +468,26 @@ needs two response headers and GitHub Pages will not set them — a service
 worker is the only thing that can, and a service worker is a JavaScript file
 by definition.
 
+**Notifications are GPUI's on the desktop and the browser's on a page.**
+GPUI posts natively on Linux, macOS and Windows, with one stable tag per
+conversation so a newer message replaces its banner, and the click response
+opens the conversation through the ordinary selection path. The macOS half
+alone goes around GPUI (`platform::notifications`), for a cached-avatar
+thumbnail `UNNotificationAttachment` wants as a file; everywhere else the
+tray blink the daemon already owned stays exactly as it was. GPUI's web
+backend leaves notifications a no-op, so the page posts through the
+Notification API instead: same per-conversation tag, same avatar as a blob
+icon URL, and a click focuses the window and queues the tag for a pump task
+that takes the same selection path. On mobile browsers that grant permission
+but reject a page-level `Notification` constructor, the existing isolation
+service worker posts the banner; its `notificationclick` handler focuses a
+client and sends the opaque tag back for that same pump task. A browser
+without an active service worker or the Notification API still degrades to
+silence. The live set is a `thread_local`, not a
+`static` — a `Notification` is a JS object and neither `Send` nor `Sync`
+under the shared-memory build — while the tag queue carries only strings, so
+the pump can wait on a worker. Permission is requested when a user opens a chat (a gesture), and an
+undecided permission means messages remain silent until it is granted.
+Permission denied or no Notification API at all (a non-secure context)
+degrades to silence rather than a panic.
+

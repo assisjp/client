@@ -10,6 +10,12 @@ pub fn request_authorization() {
     imp::request_authorization();
 }
 
+/// Retry authorization from a user gesture on the web; native startup
+/// authorization is a different operation and must not run on every chat.
+pub fn request_gesture_authorization() {
+    imp::request_gesture_authorization();
+}
+
 /// Post a native notification, attaching an already-cached profile image when
 /// the bytes are a format macOS can thumbnail.
 ///
@@ -23,7 +29,10 @@ pub fn request_authorization() {
 ///
 /// Returns `true` when the native path accepted the request. A non-macOS build,
 /// or a process not launched from an app bundle, returns `false` so callers
-/// can retain their normal GPUI path.
+/// can retain their normal GPUI path. On the web the request is posted through
+/// the browser's Notification API instead — GPUI's web backend leaves system
+/// notifications a no-op — and `false` means permission is missing or the API
+/// is unavailable, so the same GPUI fallback applies there too.
 pub fn show_notification_with_avatar(
     tag: &str,
     title: &str,
@@ -31,6 +40,23 @@ pub fn show_notification_with_avatar(
     avatar: impl Fn() -> Option<std::sync::Arc<Vec<u8>>> + Send + Sync + 'static,
 ) -> bool {
     imp::show_notification_with_avatar(tag, title, body, avatar)
+}
+
+/// Wait for the next web-notification click.
+///
+/// The browser hands a click to a JS callback, not to GPUI's response path,
+/// so the callback queues the tag and the application's pump task awaits it
+/// here, then opens the conversation through the ordinary
+/// [`crate::app::WhatsAppApp::open_system_notification`] path. Away from the
+/// web there is no such queue — clicks arrive through GPUI already — so this
+/// never resolves and the pump task parks forever.
+pub async fn next_notification_activation() -> String {
+    imp::next_notification_activation().await
+}
+
+/// Forget banners and queued clicks belonging to the departing account.
+pub fn clear_notifications() {
+    imp::clear_notifications();
 }
 
 #[cfg(target_os = "macos")]
@@ -88,6 +114,15 @@ mod imp {
     fn may_retry_plain(tag: &str, generation: u64, has_attachment: bool) -> bool {
         has_attachment && is_current_tag_submission(tag, generation)
     }
+
+    /// Unreachable by construction: clicks arrive through GPUI's response
+    /// path here, so the pump task parked on this never wakes.
+    pub(super) async fn next_notification_activation() -> String {
+        std::future::pending().await
+    }
+
+    pub(super) fn clear_notifications() {}
+    pub(super) fn request_gesture_authorization() {}
 
     pub(super) fn request_authorization() {
         // The API raises an Objective-C exception outside an application
@@ -397,9 +432,21 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+/// The page: GPUI's web backend leaves system notifications a no-op, so the
+/// browser's Notification API stands in. One live notification per stable tag
+/// mirrors the replacement semantics the desktop path gets from GPUI — a
+/// newer message in the same conversation replaces its banner — and the
+/// click handler focuses the window and queues the tag for the application's
+/// pump task (see [`super::next_notification_activation`]).
+#[cfg(target_family = "wasm")]
+#[path = "notifications/web.rs"]
+mod imp;
+
+#[cfg(not(any(target_os = "macos", target_family = "wasm")))]
 mod imp {
     pub(super) const fn request_authorization() {}
+    pub(super) const fn request_gesture_authorization() {}
+    pub(super) const fn clear_notifications() {}
 
     pub(super) fn show_notification_with_avatar(
         _tag: &str,
@@ -408,5 +455,12 @@ mod imp {
         _avatar: impl Fn() -> Option<std::sync::Arc<Vec<u8>>> + Send + Sync + 'static,
     ) -> bool {
         false
+    }
+
+    /// Unreachable by construction: clicks arrive through GPUI's response
+    /// path on every platform that compiles this half, so the pump task
+    /// parked on this never wakes.
+    pub(super) async fn next_notification_activation() -> String {
+        std::future::pending().await
     }
 }

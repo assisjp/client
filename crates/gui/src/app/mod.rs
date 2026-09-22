@@ -1868,15 +1868,23 @@ impl WhatsAppApp {
     }
 
     fn resume_visible_read(&mut self, cx: &mut Context<Self>) {
-        if !self.window_focused || !crate::platform::application_is_active() {
+        if !chat_read_can_be_committed(
+            self.window_focused,
+            crate::platform::application_is_active(),
+            self.client.is_some(),
+        ) {
             return;
         }
+        let Some(client) = self.client.as_ref() else {
+            return;
+        };
         let Some(jid) = self.visible_chat.clone() else {
             return;
         };
+        let owed = self.owed_reads.contains(&jid);
         let Some(chat) = self
             .find_chat(&jid)
-            .filter(|chat| chat.unread_count > 0 || chat.manually_unread)
+            .filter(|chat| chat_read_needs_resume(chat, owed))
         else {
             return;
         };
@@ -1884,9 +1892,8 @@ impl WhatsAppApp {
             self.owed_reads.insert(jid);
             return;
         };
-        if let Some(client) = &self.client {
-            client.mark_chat_read(&jid, newest);
-        }
+        client.mark_chat_read(&jid, newest);
+        self.owed_reads.remove(&jid);
         if let Some(chat) = self.find_chat_mut(&jid) {
             chat.mark_as_read();
         }
@@ -2552,17 +2559,23 @@ impl WhatsAppApp {
         // action separately: the daemon owns both, along with the boundary
         // that keeps a read from swallowing anything newer. All it needs from
         // here is the message this side is looking at.
-        if self.window_focused
-            && crate::platform::application_is_active()
-            && let Some(chat) = self
-                .find_chat(&jid)
-                .filter(|c| c.unread_count > 0 || c.manually_unread)
+        let mut mark_locally = false;
+        let owed = self.owed_reads.contains(&jid);
+        if chat_read_can_be_committed(
+            self.window_focused,
+            crate::platform::application_is_active(),
+            self.client.is_some(),
+        ) && let Some(chat) = self
+            .find_chat(&jid)
+            .filter(|c| chat_read_needs_resume(c, owed))
         {
             match read_bound(chat) {
                 ReadBound::Now(newest) => {
                     info!("Marking {} read", observe_str(&jid));
-                    if let Some(client) = &self.client {
+                    if let Some(client) = self.client.as_ref() {
                         client.mark_chat_read(&jid, newest);
+                        self.owed_reads.remove(&jid);
+                        mark_locally = true;
                     }
                 }
                 ReadBound::WhenLoaded => {
@@ -2571,12 +2584,15 @@ impl WhatsAppApp {
                         observe_str(&jid)
                     );
                     self.owed_reads.insert(jid.clone());
+                    mark_locally = true;
                 }
             }
         }
 
-        // Mark as read locally
-        if let Some(chat) = self.find_chat_mut(&jid) {
+        // Mark as read locally only after a remote read was sent or retained
+        // in `owed_reads`. If the app is inactive, or the session is absent,
+        // keep the unread state so activation/reattach can retry the receipt.
+        if mark_locally && let Some(chat) = self.find_chat_mut(&jid) {
             chat.mark_as_read();
             // Both caches: the badge, and the is_read snapshot the message
             // list renders ticks from (its count guard can't see this).
@@ -2684,6 +2700,7 @@ impl WhatsAppApp {
                         app.avatar_manager.set_session(Some(client.handle()));
                         app.avatar_manager.flush_demands(&client);
                         app.client = Some(client);
+                        app.resume_visible_read(cx);
                         if let Ok((control, control_rx)) = control {
                             // Its frames answer through the control session's
                             // own request table; the reader just has to keep
@@ -3699,6 +3716,18 @@ fn read_bound(chat: &Chat) -> ReadBound {
     }
 }
 
+fn chat_read_can_be_committed(
+    window_focused: bool,
+    application_active: bool,
+    client_available: bool,
+) -> bool {
+    window_focused && application_active && client_available
+}
+
+fn chat_read_needs_resume(chat: &Chat, owed: bool) -> bool {
+    owed || chat.unread_count > 0 || chat.manually_unread
+}
+
 fn read_is_allowed(
     window_focused: bool,
     application_active: bool,
@@ -4113,6 +4142,23 @@ mod tests {
         assert!(!read_is_allowed(true, true, false, false));
         assert!(!read_is_allowed(true, true, true, true));
         assert!(read_is_allowed(true, true, true, false));
+    }
+
+    #[test]
+    fn chat_reads_stay_pending_until_window_and_client_can_commit_them() {
+        assert!(!chat_read_can_be_committed(false, true, true));
+        assert!(!chat_read_can_be_committed(true, false, true));
+        assert!(!chat_read_can_be_committed(true, true, false));
+        assert!(chat_read_can_be_committed(true, true, true));
+    }
+
+    #[test]
+    fn an_owed_read_is_resumed_after_local_badge_was_cleared() {
+        let mut row = chat("a@s.whatsapp.net", Some(10));
+        row.mark_as_read();
+
+        assert!(!chat_read_needs_resume(&row, false));
+        assert!(chat_read_needs_resume(&row, true));
     }
 
     #[test]

@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 
 use gpui::{App, Context};
-use log::debug;
+use log::{debug, error};
 use oxidezap_core::{Chat, ChatMessage};
 use oxidezap_ipc::PageCursor;
 use wacore_binary::jid::observe_str;
@@ -45,6 +45,9 @@ pub(super) enum Paging {
     /// still committing batches, and asking again from there is asking for
     /// exactly what was not there the first time.
     Done { from: Option<PageCursor> },
+    /// The daemon returned the cursor we just asked from. Do not ask it again
+    /// until a history change gives this list a reason to retry.
+    Stalled { from: PageCursor },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +55,7 @@ enum ChatPageArrival {
     Ignored,
     Applied,
     Restarted,
+    Rejected,
 }
 
 /// Requests needed to hydrate both chat lists for an unresolved notification.
@@ -88,7 +92,7 @@ impl Paging {
         match self {
             Self::Unasked => Some(None),
             Self::More(cursor) => Some(Some(cursor.clone())),
-            Self::Loading { .. } | Self::Done { .. } => None,
+            Self::Loading { .. } | Self::Done { .. } | Self::Stalled { .. } => None,
         }
     }
 
@@ -111,6 +115,7 @@ impl Paging {
         match self {
             Self::Done { from: Some(cursor) } => Self::More(cursor.clone()),
             Self::Done { from: None } => Self::Unasked,
+            Self::Stalled { from } => Self::More(from.clone()),
             unsettled => unsettled.clone(),
         }
     }
@@ -242,6 +247,12 @@ impl Pages {
         if archived && std::mem::take(&mut self.restart_archived_after_load) {
             self.archived_chats = Paging::Unasked;
             return ChatPageArrival::Restarted;
+        }
+        if let (Some(from), Some(returned)) = (asked_from.as_ref(), next.as_ref())
+            && from == returned
+        {
+            *self.chat_list(archived) = Paging::Stalled { from: from.clone() };
+            return ChatPageArrival::Rejected;
         }
         *self.chat_list(archived) = Paging::arrived(asked_from, next);
         ChatPageArrival::Applied
@@ -475,6 +486,12 @@ impl WhatsAppApp {
                 // This answer was ordered before the history change. The
                 // next request restarts the scan and clears its seen set.
                 cx.notify();
+                return;
+            }
+            ChatPageArrival::Rejected => {
+                // This is not a complete scan. Do not merge the page or prune
+                // archived chats as though the daemon had reached the end.
+                error!("chat page returned a non-advancing cursor");
                 return;
             }
             ChatPageArrival::Applied => {}
@@ -749,6 +766,47 @@ mod tests {
 
         assert_eq!(pages.more_chats(false), Some(Some(cursor("active-next"))));
         assert_eq!(pages.more_chats(true), Some(Some(cursor("archive-next"))));
+    }
+
+    #[test]
+    fn a_nonadvancing_chat_cursor_stalls_without_completing_the_scan() {
+        for archived in [false, true] {
+            let mut pages = Pages::new();
+            assert_eq!(pages.more_chats(archived), Some(None));
+            assert_eq!(
+                pages.chat_page_arrived(archived, Some(cursor("same"))),
+                ChatPageArrival::Applied
+            );
+            assert_eq!(pages.more_chats(archived), Some(Some(cursor("same"))));
+            assert_eq!(
+                pages.chat_page_arrived(archived, Some(cursor("same"))),
+                ChatPageArrival::Rejected
+            );
+            assert!(matches!(
+                pages.chat_list(archived),
+                Paging::Stalled { from } if *from == cursor("same")
+            ));
+            assert_eq!(
+                pages.more_chats(archived),
+                None,
+                "do not repeat the IPC ask"
+            );
+
+            let plan = pages.notification_page_plan();
+            assert!(!plan.done(), "an incomplete scan cannot rule out a chat");
+            assert!(!plan.active_done && !plan.archived_done);
+
+            pages.reopen(&[]);
+            assert_eq!(
+                pages.more_chats(archived),
+                if archived {
+                    Some(None)
+                } else {
+                    Some(Some(cursor("same")))
+                },
+                "a history change may make the cursor usable again"
+            );
+        }
     }
 
     #[test]

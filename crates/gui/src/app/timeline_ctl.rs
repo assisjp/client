@@ -177,6 +177,59 @@ impl WhatsAppApp {
     }
 
     /// The emojis the quick-react strip offers, in the order it offers them.
+    /// Vote on a poll option.
+    ///
+    /// One tap replaces the single-choice ballot. Multi-select voting is
+    /// disabled until the daemon owns the authoritative ballot: another tab
+    /// may already have selected options that this window cannot see, and
+    /// sending its local vector would silently replace those selections.
+    /// Offline the daemon would refuse,
+    /// so the tap is refused here where the window can say why. The tap is
+    /// not drawn as confirmed: the daemon may still refuse the ballot, and
+    /// the legacy IPC request has no completion event. The radio therefore
+    /// stays empty and the user can retry rather than being locked into a
+    /// false local result.
+    pub fn vote_poll(
+        &mut self,
+        chat_jid: &str,
+        message_id: &str,
+        option_index: u32,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_send() {
+            warn!("Cannot vote: this window is offline");
+            return;
+        }
+        // Read the limit off the poll itself: no local ballot is authoritative.
+        let limit = self
+            .find_chat(chat_jid)
+            .and_then(|chat| chat.messages.iter().find(|m| m.id == message_id))
+            .and_then(|message| message.poll.as_ref())
+            .map_or(1, |poll| poll.selectable_count.max(1));
+        // Without the daemon's current ballot, a second tab cannot know
+        // whether this vote would replace selections made in the first.
+        // Refuse multi-select until authoritative ballots are available.
+        if limit > 1 {
+            warn!("Multiple-choice voting needs synchronized ballots");
+            return;
+        }
+        if let Some(client) = self.client.as_ref() {
+            client.vote_poll(chat_jid, message_id, vec![option_index]);
+            self.attempted_poll_votes
+                .insert((chat_jid.to_string(), message_id.to_string()), option_index);
+            self.invalidate_message_cache(chat_jid, cx);
+            cx.notify();
+            debug!("poll vote requested for {message_id}; no confirmation on legacy IPC");
+        }
+    }
+
+    /// An attempt, not a confirmed selection. The bubble labels it as such.
+    pub fn attempted_poll_vote(&self, chat_jid: &str, message_id: &str) -> Option<u32> {
+        self.attempted_poll_votes
+            .get(&(chat_jid.to_string(), message_id.to_string()))
+            .copied()
+    }
+
     ///
     /// Fixed rather than the full emoji table: this is a reaction control,
     /// not an emoji picker, and anything typed beyond these travels the

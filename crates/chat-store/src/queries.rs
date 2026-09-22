@@ -1256,6 +1256,73 @@ impl ChatStore {
         }
     }
 
+    /// A poll creation's secret from the library's `msg_secrets` index.
+    ///
+    /// The fallback when the stored proto carries no secret: rows compacted
+    /// before poll votes existed had their secret-only envelope stripped,
+    /// and history re-inserts never overwrite them, so those polls would
+    /// otherwise stay unvotable forever. The library captures the secret
+    /// into this same file at receive time (and seeds history in bulk),
+    /// keyed by non-AD chat and sender exactly as derived here — the same
+    /// derivation its own `MsgSecretEntry::new` uses, so the two cannot
+    /// drift. `None` when no row is there (pruned, or never captured), in
+    /// which case the vote is refused rather than guessed.
+    pub async fn poll_secret(
+        &self,
+        chat: &Jid,
+        sender: &Jid,
+        msg_id: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let device_id = self.device_id();
+        let chat_key = chat.to_non_ad_string();
+        // Incoming direct messages use the peer; outgoing ones use our own
+        // identity (and their history rows can have an empty sender). For
+        // a direct-chat miss, look up by chat and message id without sender:
+        // IDs are unique within that chat, while group chats must always
+        // disambiguate by participant.
+        let sender_key = if sender.is_same_chat_as(chat) {
+            chat_key.clone()
+        } else {
+            sender.to_non_ad_string()
+        };
+        let direct = !chat.is_group();
+        let msg_id = msg_id.to_owned();
+        let secret = self
+            .db()
+            .read(move |conn| {
+                #[derive(diesel::QueryableByName)]
+                struct SecretRow {
+                    #[diesel(sql_type = diesel::sql_types::Binary)]
+                    secret: Vec<u8>,
+                }
+                // The message lookup accepts mapped PN/LID chat keys. The
+                // library may have captured the secret before that mapping
+                // was learned, so try those same keys here too.
+                let keys =
+                    crate::lid::chat_key_candidates(conn, device_id, &chat_key).map_err(db_err)?;
+                for key in keys {
+                    let row: Option<SecretRow> = diesel::sql_query(
+                        "SELECT secret FROM msg_secrets WHERE device_id = ? AND chat = ? \
+                         AND (sender = ? OR ?) AND msg_id = ? LIMIT 1",
+                    )
+                    .bind::<diesel::sql_types::Integer, _>(device_id)
+                    .bind::<diesel::sql_types::Text, _>(&key)
+                    .bind::<diesel::sql_types::Text, _>(&sender_key)
+                    .bind::<diesel::sql_types::Bool, _>(direct)
+                    .bind::<diesel::sql_types::Text, _>(&msg_id)
+                    .get_result(conn)
+                    .optional()
+                    .map_err(db_err)?;
+                    if let Some(row) = row {
+                        return Ok(Some(row.secret));
+                    }
+                }
+                Ok(None)
+            })
+            .await?;
+        Ok(secret)
+    }
+
     /// Every reaction on one message.
     ///
     /// The page query with a page of one, so there is a single statement to

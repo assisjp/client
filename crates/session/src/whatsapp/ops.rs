@@ -11,7 +11,7 @@ use whatsapp_rust::wacore_binary::jid::{Jid, JidExt as _};
 use whatsapp_rust::waproto::whatsapp as wa;
 
 use super::WhatsAppClient;
-use super::convert::stored_to_chat_message;
+use super::convert::{poll_creation_of, stored_to_chat_message};
 use crate::exec::Task;
 
 /// How long a backfill waits for the phone's answer to land in the store.
@@ -153,7 +153,11 @@ impl WhatsAppClient {
     ///
     /// The names, the secret and the creator behind those indexes come from
     /// the stored creation message: a vote encrypts the option hashes to
-    /// the creation's secret, and none of the three is guessable.
+    /// the creation's secret, and none of the three is guessable. The
+    /// secret is read off the stored proto first, falling back to the
+    /// library's own secret index for rows compacted before votes existed
+    /// — those had the envelope stripped and history never overwrites them,
+    /// so without the fallback they stay unvotable forever.
     pub fn vote_poll(
         &self,
         chat_jid: String,
@@ -193,14 +197,36 @@ impl WhatsAppClient {
                     .ok_or_else(|| format!("poll has no option {index}"))?;
                 names.push(option);
             }
+            // Outgoing direct history rows can have an empty sender. The
+            // poll's creator is us, not the default JID hydrated from that
+            // empty column; encryption and the vote key both need our real
+            // identity in the chat's addressing namespace.
+            let creator = if stored.from_me && !chat.is_group() {
+                if chat.is_lid() {
+                    live.client.lid().or_else(|| live.client.pn())
+                } else {
+                    live.client.pn()
+                }
+                .ok_or_else(|| "account JID unavailable for poll vote".to_string())?
+            } else {
+                stored.sender_jid.clone()
+            };
             let secret = base
                 .message_context_info
                 .as_option()
-                .and_then(|info| info.message_secret.clone())
-                .ok_or_else(|| "the poll's secret was not stored".to_string())?;
+                .and_then(|info| info.message_secret.clone());
+            let secret = match secret {
+                Some(secret) => secret,
+                None => live
+                    .chat_store
+                    .poll_secret(&chat, &creator, &poll_id)
+                    .await
+                    .map_err(|e| format!("database query failed: {e}"))?
+                    .ok_or_else(|| "the poll's secret was not stored".to_string())?,
+            };
             live.client
                 .polls()
-                .vote(&chat, &poll_id, &stored.sender_jid, &secret, &names)
+                .vote(&chat, &poll_id, &creator, &secret, &names)
                 .await
                 .map(|_| ())
                 .map_err(|e| e.to_string())
@@ -1173,14 +1199,6 @@ impl WhatsAppClient {
     }
 }
 
-/// The creation message behind a stored row, either protocol version.
-fn poll_creation_of(message: &wa::Message) -> Option<&wa::message::PollCreationMessage> {
-    message
-        .poll_creation_message_v3
-        .as_option()
-        .or_else(|| message.poll_creation_message.as_option())
-}
-
 /// A stored row as the poll its creation message describes.
 fn poll_view_of(stored: oxidezap_chat_store::StoredMessage) -> Option<PollView> {
     let proto = stored.message.as_deref()?;
@@ -1192,7 +1210,7 @@ fn poll_view_of(stored: oxidezap_chat_store::StoredMessage) -> Option<PollView> 
         options: creation
             .options
             .iter()
-            .filter_map(|o| o.option_name.clone())
+            .map(|o| o.option_name.clone().unwrap_or_default())
             .collect(),
         selectable_count: creation.selectable_options_count.unwrap_or(1),
     })
